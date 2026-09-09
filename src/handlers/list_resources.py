@@ -33,6 +33,12 @@ def resolve_resource_types(requested: Optional[List[str]]) -> List[str]:
         return list(SUPPORTED_RESOURCE_TYPES)
 
     normalized = [str(t).strip().upper() for t in requested if str(t).strip()]
+    if not normalized:
+        # A list of nothing but blanks reads as "no scope given", not "no types" —
+        # returning [] here would drop the server-side filter and widen the run to
+        # every resource type in the account, including ones we cannot restore.
+        return list(SUPPORTED_RESOURCE_TYPES)
+
     unsupported = [t for t in normalized if t not in SUPPORTED_RESOURCE_TYPES]
     if unsupported:
         raise ValueError(

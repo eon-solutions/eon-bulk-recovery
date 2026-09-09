@@ -9,6 +9,7 @@
   "resourceNamePrefix": null,
   "dynamodbRegionalWcuLimit": null,
   "dynamodbTableWcuMax": null,
+  "dynamodbRestoreMethod": "auto",
   "crossAccountRoleArn": null,
   "excludeEC2TagKeys": [],
   "recoveryStackNames": [],

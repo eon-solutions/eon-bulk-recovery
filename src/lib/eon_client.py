@@ -21,7 +21,8 @@ class EonClient:
             client_secret: Eon API client secret
             project_id: Eon project ID
         """
-        self.base_url = f"https://{account_domain}.console.eon.io/api/v1"
+        self.api_root = f"https://{account_domain}.console.eon.io/api"
+        self.base_url = f"{self.api_root}/v1"
         self.client_id = client_id
         self.client_secret = client_secret
         self.project_id = project_id
@@ -383,7 +384,8 @@ class EonClient:
         resource_id: str,
         snapshot_id: str,
         restore_account_id: str,
-        destination_config: Dict[str, Any]
+        destination_config: Dict[str, Any],
+        restore_method: Optional[str] = None
     ) -> str:
         """
         Restore a DynamoDB table from a snapshot.
@@ -393,6 +395,10 @@ class EonClient:
             snapshot_id: Snapshot ID to restore from
             restore_account_id: Eon-assigned restore account ID
             destination_config: DynamoDB restore configuration
+            restore_method: RESTORE_METHOD_IMPORT_TABLE to rebuild the table with
+                the AWS ImportTable (import-from-S3) API, RESTORE_METHOD_CAPACITY_BASED
+                to write items back through the DynamoDB write path, or
+                RESTORE_METHOD_AUTO to let Eon pick. Omitted means capacity-based.
 
         Returns:
             Job ID for the restore operation
@@ -402,10 +408,58 @@ class EonClient:
             "restoreAccountId": restore_account_id,
             "destination": destination_config
         }
+        if restore_method:
+            payload["restoreMethod"] = restore_method
 
         response = requests.post(url, json=payload, headers=self._get_headers())
         self._handle_response(response, "POST", url, payload)
         return response.json().get("jobId")
+
+    def check_dynamodb_import_availability(
+        self,
+        snapshot_id: str,
+        region: str,
+        restored_name: str
+    ) -> Dict[str, Any]:
+        """
+        Check whether a DynamoDB snapshot can be restored with the ImportTable
+        (import-from-S3) method.
+
+        The check is snapshot-level: it reports Local Secondary Indexes, which
+        ImportTable cannot create, and table sizes above the AWS import ceiling
+        (15 TiB in us-east-1/us-west-1/us-west-2, 1 TiB elsewhere). It does not
+        check the restore account's role version — that is validated when the
+        restore is submitted.
+
+        Args:
+            snapshot_id: Snapshot ID to check
+            region: Region the table would be restored into (sets the size ceiling)
+            restored_name: Name the table would be restored under. Not part of the
+                decision, but the destination schema requires it and the request
+                is rejected with a 400 without it.
+
+        Returns:
+            Dict with "available" (bool) and "reasons" (list of reason codes)
+        """
+        # This endpoint is not under /v1 (see openapi-index.yaml).
+        url = f"{self.api_root}/projects/{self.project_id}/snapshots/{snapshot_id}/dynamodb-restore-method-availability"
+        payload = {
+            "restoreMethod": "RESTORE_METHOD_IMPORT_TABLE",
+            "destination": {
+                "awsDynamodb": {
+                    "restoreRegion": region,
+                    "restoredName": restored_name
+                }
+            }
+        }
+
+        response = requests.post(url, json=payload, headers=self._get_headers())
+        self._handle_response(response, "POST", url, payload)
+        data = response.json()
+        return {
+            "available": bool(data.get("available")),
+            "reasons": data.get("reasons") or []
+        }
 
     def restore_dynamodb_to_existing_table(
         self,

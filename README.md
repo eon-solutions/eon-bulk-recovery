@@ -1,5 +1,8 @@
 # Eon Bulk Recovery Application
 
+[![tests](https://github.com/eon-solutions/eon-bulk-recovery/actions/workflows/test.yml/badge.svg)](https://github.com/eon-solutions/eon-bulk-recovery/actions/workflows/test.yml)
+[![coverage](https://img.shields.io/badge/coverage-%E2%89%A598%25-brightgreen)](#tests)
+
 Automated disaster recovery application for AWS resources backed up by Eon. Uses AWS Step Functions to orchestrate complete multi-region restore workflows.
 
 ```mermaid
@@ -166,6 +169,8 @@ aws stepfunctions start-execution \
 **Minimal example (AWS Organizations):**
 
 > **Important:** All fields must be present in the execution input — Step Functions will fail at runtime if any key referenced in the state machine is missing. Use `null`, `[]`, or `false` for unused optional fields.
+>
+> The one exception is `dynamodbRestoreMethod`, which the workflow defaults for you (see [DynamoDB Restore Method](#dynamodb-restore-method)). An input written before that key existed still runs.
 
 ```json
 {
@@ -177,6 +182,7 @@ aws stepfunctions start-execution \
   "resourceIds": [],
   "resourceNamePrefix": null,
   "dynamodbRegionalWcuLimit": 40000,
+  "dynamodbRestoreMethod": "auto",
   "crossAccountRoleArn": null,
   "excludeEC2TagKeys": [],
   "recoveryStackNames": [],
@@ -293,14 +299,58 @@ S3 bucket names are **globally unique** across all AWS accounts worldwide. This 
 | `recoveryStacksOnly` | No | When `true`, only restore resources that match a stack table/bucket — skip EC2, RDS, and unmatched DynamoDB/S3 (default: false) |
 | `s3InPlaceTagKey` | No | Tag key used to match source and target S3 buckets for in-place restore (default: `"eon_functional_id"`). The tag value can be any string — bucket name, hash, UUID, etc. |
 
+### DynamoDB Restore Method
+
+New DynamoDB tables are rebuilt one of two ways:
+
+| Method | How it works | Capacity cost |
+|--------|--------------|---------------|
+| **ImportTable** (default where available) | Eon stages the snapshot as DynamoDB JSON in S3 and calls the AWS `ImportTable` API. AWS creates the table, loads it, and builds the GSIs in one pass. | None. The table is created with the source table's own billing mode and throughput. |
+| **Capacity-based** | Eon writes the items back through the DynamoDB write API at the provisioned WCU. | Consumes the regional write-throughput quota, so restore speed is bounded by it. |
+
+ImportTable is the faster path for anything large, and because it consumes no
+write capacity it leaves the regional WCU budget to the tables that still need it.
+`dynamodbRestoreMethod` selects the method:
+
+| Value | Behaviour |
+|-------|-----------|
+| `"auto"`, `null`, or the key omitted (default) | ImportTable for every table that can take it, capacity-based for the rest |
+| `"import"` | Force ImportTable. A table AWS cannot import fails at initiation instead of restoring a different way |
+| `"capacity"` | Force the write path for every table |
+
+Under `"auto"` the workflow checks each snapshot before it submits anything, and
+the reasons for each fallback are printed in the `Initiate Restores` log and
+recorded on the job. A table falls back when:
+
+- **It has local secondary indexes.** `ImportTable` can only create GSIs; an LSI has to exist when the table is created and AWS does not accept one here.
+- **It is over the AWS import size limit:** 15 TiB in `us-east-1`, `us-west-1` and `us-west-2`, 1 TiB in every other region.
+- **The restore account's Eon role is older than 1.8.1**, which is where `dynamodb:ImportTable` was added.
+
+On that last point: the bootstrap step installs the current published template when it creates a
+restore-account stack, but it does **not** upgrade a stack that already exists — it only checks
+the role is still there and reuses it. A restore account onboarded before 1.8.1 therefore stays
+on its old role indefinitely and every table quietly falls back to the capacity-based path. The
+`Initiate Restores` log names the installed version when this happens. To move such an account
+onto ImportTable, upgrade its Eon role (the console offers this when `version.installed` is
+behind `version.latest`, or update its `eon-restore-account-<id>` CloudFormation stack with the
+current published template).
+
+Two AWS behaviours to expect on the import path:
+
+- **The table does not exist until the import finishes.** There is no partially populated table to watch, and nothing appears in the DynamoDB console until AWS reports the import. Track progress on the import job itself with `aws dynamodb describe-import`.
+- **Tags are applied after the import completes**, because `TableCreationParameters` does not carry them.
+
+In-place restores into recovery-stack tables are always capacity-based: the table
+already exists, and `ImportTable` only creates new ones.
+
 ### DynamoDB WCU Allocation
 
-When restoring DynamoDB tables, the workflow distributes Write Capacity Units (WCUs) across tables **per-region** to maximize restore throughput without exceeding account limits. This applies to both new table restores and in-place restores (recovery stack tables).
+When restoring DynamoDB tables, the workflow distributes Write Capacity Units (WCUs) across tables **per-region** to maximize restore throughput without exceeding account limits. This applies to capacity-based new table restores and to in-place restores (recovery stack tables). Tables going through [ImportTable](#dynamodb-restore-method) are left out of the allocation, since they never write through the DynamoDB API — counting them would take capacity away from the tables that do.
 
 **How it works:**
-1. Tables with known sizes (from Eon's resource inventory) are allocated first, proportionally to their size — a 10 GB table gets 10× the WCUs of a 1 GB table
-2. 95% of the regional WCU limit is used (default: 38,000 out of 40,000) to leave headroom
-3. Tables with unknown sizes (0 bytes) receive a small default allocation (50 WCU) from whatever capacity remains
+1. 95% of the regional WCU limit is used (default: 38,000 out of 40,000) to leave headroom
+2. Tables reporting 0 bytes get no allocation. There is nothing to write back, so any WCU they took would come out of a table that does have data. The restore request omits `writeCapacityUnits` for these and Eon applies its own minimum
+3. The budget is split between the tables with known sizes, proportionally to size — a 10 GB table gets 10× the WCUs of a 1 GB table
 
 **Example:** 3 tables in us-east-1 with a 40,000 WCU limit:
 
@@ -308,7 +358,9 @@ When restoring DynamoDB tables, the workflow distributes Write Capacity Units (W
 |-------|------|------------|
 | orders | 30 GB (75%) | 28,500 WCU |
 | users | 10 GB (25%) | 9,500 WCU |
-| cache | 0 GB (unknown) | 50 WCU |
+| cache | 0 GB | none (Eon default) |
+
+One caveat on the 0-byte case: DynamoDB refreshes `TableSizeBytes` roughly every six hours, and that is what Eon's inventory reports. A table filled shortly before the backup can report 0 while holding data, and will restore at Eon's minimum capacity rather than a share of the budget. It still restores correctly, just slowly. Tables going through [ImportTable](#dynamodb-restore-method) are unaffected either way, since that path does not use write capacity at all.
 
 **Per-table cap:** `dynamodbTableWcuMax` (default: 40,000) limits the WCU assigned to any single table. This matters when you raise the regional limit — e.g., with `dynamodbRegionalWcuLimit: 80000` and two tables, each table would get ~38,000 WCU rather than one table consuming 76,000. The restore process uses DynamoDB provisioned capacity, so the per-table cap prevents a single table from monopolizing throughput.
 
@@ -330,7 +382,8 @@ DynamoDB partitions have a hard limit of **1,000 WCU each**. Even with 40,000 WC
 **Warm throughput** tells DynamoDB to pre-allocate enough partitions to handle the specified write throughput immediately, rather than scaling reactively. The workflow automatically sets warm throughput on all restored DynamoDB tables:
 
 - **In-place restores (recovery stack tables):** Warm throughput is set after WCU scaling, **before** the restore begins — partitions are pre-allocated before any writes start.
-- **New table restores:** The monitoring handler sets warm throughput once the Eon-created table exists and is ACTIVE. Even mid-restore, this helps by pre-allocating more partitions for the remaining write volume.
+- **New table restores (capacity-based):** The monitoring handler sets warm throughput once the Eon-created table exists and is ACTIVE. Even mid-restore, this helps by pre-allocating more partitions for the remaining write volume.
+- **New table restores (ImportTable):** Not applied. AWS writes the data itself, and the table only exists once the import has finished.
 - **GSIs:** Warm throughput is also applied to Global Secondary Indexes, since base table writes trigger GSI updates.
 
 **Important characteristics:**
@@ -343,6 +396,19 @@ DynamoDB partitions have a hard limit of **1,000 WCU each**. Even with 40,000 WC
 Warm throughput is enabled by default. To disable it, set `dynamodbWarmThroughput` to `false` in the execution input (the Lambda handler reads this directly — it is not passed through the state machine definition).
 
 **Custom cross-account role permissions:** When using a custom `crossAccountRoleArn`, the role must include DynamoDB permissions for WCU scaling — see [Cross-Account Setup (Option B)](#option-b-manual-cross-account-role) for the full list. Built-in admin roles already have these.
+
+## Tests
+
+```bash
+python -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
+.venv/bin/pytest
+```
+
+`pytest` runs the whole suite with branch coverage and fails below 98%. Nothing
+in the suite touches AWS or the Eon API: boto3 clients are stubbed per
+(service, region), Eon HTTP calls go through `responses`, and the shared
+fixtures set the Lambda environment variables so a call that escapes a stub
+fails loudly rather than reaching an account.
 
 ## How It Works
 

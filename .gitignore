@@ -24,6 +24,7 @@ wheels/
 *.egg
 
 # Virtual environments
+.venv/
 venv/
 ENV/
 env/
@@ -46,3 +47,9 @@ secrets.json
 
 # Logs
 *.log
+
+# Test artefacts
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/

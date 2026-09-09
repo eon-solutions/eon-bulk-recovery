@@ -5,6 +5,69 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] - 2026-09-09
+
+### Added
+
+- **`dynamodbRestoreMethod` execution input.** Selects how new DynamoDB tables are rebuilt:
+  `"auto"` (default), `"import"`, or `"capacity"`. Optional — the state machine applies the
+  default when the key is absent, so an execution input written before this release still runs.
+
+### Changed
+
+- **DynamoDB tables now restore via AWS `ImportTable` by default.** Eon stages the snapshot as
+  DynamoDB JSON in S3 and AWS creates, loads and indexes the table in one pass, instead of
+  writing every item back through the DynamoDB write API. Under `"auto"` each snapshot is
+  checked before submission and falls back to the capacity-based path when the table has local
+  secondary indexes, exceeds the AWS import size limit for the region (15 TiB in
+  `us-east-1`/`us-west-1`/`us-west-2`, 1 TiB elsewhere), or the restore account's Eon role is
+  older than 1.8.1. The reason is logged and recorded on the job. In-place restores into
+  recovery-stack tables are unaffected: `ImportTable` only creates new tables.
+- **WCU allocation covers only the tables that write through the DynamoDB API.** ImportTable
+  restores consume no write capacity, so including them in the regional budget starved the
+  tables that fall back to the capacity-based path. In-place tables are now also counted against
+  the region they are restored into rather than the region a new table would have used.
+- **Warm throughput is skipped for ImportTable restores.** The table does not exist until the
+  import completes, so there are no partitions to pre-allocate.
+- **An all-rejected run now sends subject `Eon Bulk Recovery - REJECTED`** instead of `- FAILURE`,
+  because nothing ran and the fix-and-re-run remedy is different. If you filter notification mail
+  on the exact subject, add the new value.
+- **Optional execution-input keys can now carry a default.** The state machine starts with an
+  `Apply Input Defaults` / `Normalize Input` pair that layers the supplied input over a defaults
+  object, so a key the ASL references by JSONPath no longer has to be present. Only
+  `dynamodbRestoreMethod` is defaulted today; every other key is still required.
+- **A DynamoDB table reporting 0 bytes gets no WCU allocation.** There is nothing to write back,
+  so the restore request omits `writeCapacityUnits` and Eon applies its own minimum. Previously
+  the sized tables consumed 100% of the regional budget and every 0-byte table landed on 1 WCU
+  anyway; now the budget goes entirely to the tables that have data.
+
+### Fixed
+
+- **The restore role version was never read, so ImportTable never fired.** `get_restore_role_version`
+  looked for a flat `installedVersion`; a RestoreAccount carries it at `version.installed`. The
+  read returned `None` for every account, which the viability check treats as "below 1.8.1", so
+  `auto` silently fell back to capacity-based everywhere.
+- **Rejected jobs are now reported as rejected, with their cause.** `JOB_REJECTED` (Eon refusing
+  to start a job, typically a permissions precondition) was folded into the failed count and the
+  Eon `errorCode` was dropped entirely, so the notification said "restore jobs failed" and never
+  named the thing to fix. The job status now carries `errorCode`, the notification prints it, an
+  all-rejected run gets a `REJECTED` subject telling you to fix and re-run, and mixed runs say how
+  many of the failures were rejections.
+- **A `resourceTypes` list containing only blanks no longer widens the run.** `["", "  "]`
+  normalised to `[]`, which dropped the server-side type filter and pulled in every resource
+  type in the account, including ones the workflow cannot restore. It now means the same as
+  omitting the field.
+- **The completion notification's duration no longer reads `Unknown`.** `send_completion_notification`
+  used `datetime.utcnow()`, which is deprecated and raises under `-W error`; the surrounding
+  `except Exception` swallowed it and fell through to `Unknown`. Now uses timezone-aware
+  `datetime.now(timezone.utc)` and treats a naive `startTime` as UTC.
+
+### Added (development)
+
+- **Test suite.** `pytest` under `tests/`, 510 tests at 99% branch coverage, gated at 98%. No
+  test touches AWS or the Eon API. `pip install -r requirements-dev.txt && pytest`.
+- **CI.** `.github/workflows/test.yml` runs the suite plus `sam validate --lint` on push and PR.
+
 ## [1.1.0] - 2026-08-31
 
 ### Added

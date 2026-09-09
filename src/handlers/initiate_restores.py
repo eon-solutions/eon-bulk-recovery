@@ -24,6 +24,33 @@ from lib.aws_utils import get_eon_credentials, get_cross_account_credentials, cr
 DYNAMODB_STACK_RESOURCE_TYPES = ("AWS::DynamoDB::Table", "AWS::DynamoDB::GlobalTable")
 
 
+# DynamoDB restore methods, as the Eon API names them.
+RESTORE_METHOD_IMPORT_TABLE = "RESTORE_METHOD_IMPORT_TABLE"
+RESTORE_METHOD_CAPACITY_BASED = "RESTORE_METHOD_CAPACITY_BASED"
+
+# Accepted values for the dynamodbRestoreMethod execution input.
+DYNAMODB_RESTORE_METHOD_AUTO = "auto"
+DYNAMODB_RESTORE_METHOD_IMPORT = "import"
+DYNAMODB_RESTORE_METHOD_CAPACITY = "capacity"
+DYNAMODB_RESTORE_METHOD_CHOICES = (
+    DYNAMODB_RESTORE_METHOD_AUTO,
+    DYNAMODB_RESTORE_METHOD_IMPORT,
+    DYNAMODB_RESTORE_METHOD_CAPACITY,
+)
+
+# ImportTable needs restore-account role 1.8.1 or newer (it grants the
+# dynamodb:ImportTable and S3 access-point permissions the import path uses).
+MIN_ROLE_VERSION_FOR_IMPORT = (1, 8, 1)
+
+# Reason codes the availability endpoint returns, in readable form.
+_IMPORT_UNAVAILABLE_REASONS = {
+    "RESTORE_METHOD_HAS_LSI": "table has local secondary indexes, which ImportTable cannot create",
+    "RESTORE_METHOD_SIZE_LIMIT": "table is larger than the AWS import limit for this region "
+                                 "(15 TiB in us-east-1/us-west-1/us-west-2, 1 TiB elsewhere)",
+    "RESTORE_METHOD_NOT_SPECIFIED": "no restore method specified",
+}
+
+
 # ---------------------------------------------------------------------------
 # Shared utilities
 # ---------------------------------------------------------------------------
@@ -201,6 +228,172 @@ def sanitize_rds_identifier(name: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# DynamoDB restore method selection
+# ---------------------------------------------------------------------------
+
+def parse_role_version(version: Optional[str]) -> Optional[Tuple[int, int, int]]:
+    """
+    Parse an Eon restore-role version ("1.8.1", "1.9.0-rc.1") into a comparable
+    tuple. A prerelease sorts below its release, matching how Eon compares the
+    version server-side, so "1.8.1-rc.1" does not satisfy a 1.8.1 minimum.
+    Returns None when the version is missing or unparseable.
+    """
+    if not version:
+        return None
+
+    core = version.strip().lstrip("v").split("+", 1)[0]
+    core, _, prerelease = core.partition("-")
+
+    parts = core.split(".")
+    if len(parts) != 3:
+        return None
+
+    try:
+        major, minor, patch = (int(part) for part in parts)
+    except ValueError:
+        return None
+
+    if prerelease:
+        # Sort below the release it precedes.
+        if patch > 0:
+            patch -= 1
+        elif minor > 0:
+            minor, patch = minor - 1, 999
+        elif major > 0:
+            major, minor, patch = major - 1, 999, 999
+        else:
+            return (0, 0, 0)
+
+    return (major, minor, patch)
+
+
+def get_restore_role_version(
+    eon_client: EonClient,
+    eon_restore_account_id: str,
+    restore_account_id: str,
+) -> Optional[str]:
+    """
+    Read the restore role version Eon has installed on the restore account.
+
+    The version lives at ``version.installed`` on a RestoreAccount. (A flat
+    ``installedVersion`` appears on the separate Account schema, so accept that
+    too rather than silently reading None and disabling ImportTable.)
+    """
+    try:
+        response = eon_client.list_restore_accounts(provider_account_id=restore_account_id)
+    except Exception as e:
+        print(f"WARNING: Could not list restore accounts to read the role version: {e}")
+        return None
+
+    for account in response.get("accounts", []):
+        if account.get("id") == eon_restore_account_id:
+            version = (account.get("version") or {}).get("installed")
+            return version or account.get("installedVersion")
+
+    print(f"WARNING: Restore account {eon_restore_account_id} not found in the account listing")
+    return None
+
+
+def plan_dynamodb_restore_methods(
+    eon_client: EonClient,
+    dynamodb_candidates: List[Dict[str, Any]],
+    requested_method: str,
+    eon_restore_account_id: str,
+    restore_account_id: str,
+) -> Dict[str, Dict[str, Any]]:
+    """
+    Decide, per table, whether to restore via the AWS ImportTable (import-from-S3)
+    path or the capacity-based write path.
+
+    ImportTable rebuilds the table from DynamoDB JSON staged in S3, so it does not
+    consume the restore account's write capacity and is not bounded by the regional
+    WCU quota. It cannot create local secondary indexes, is capped at the AWS import
+    size limit for the region, needs restore-role 1.8.1 or newer, and only applies
+    to new-table restores — the existing-table (in-place) API has no method option.
+
+    Args:
+        eon_client: Authenticated Eon client
+        dynamodb_candidates: New-table DynamoDB restores, each with resourceId,
+            resourceName, restoredName and region (the region it is restored into)
+        requested_method: One of DYNAMODB_RESTORE_METHOD_CHOICES
+        eon_restore_account_id: Eon-assigned restore account ID
+        restore_account_id: AWS account ID of the restore account
+
+    Returns:
+        Dictionary mapping resource_id to {"method": ..., "reasons": [...]}
+    """
+    plan: Dict[str, Dict[str, Any]] = {}
+
+    if not dynamodb_candidates:
+        return plan
+
+    if requested_method == DYNAMODB_RESTORE_METHOD_CAPACITY:
+        print(f"\nDynamoDB restore method: capacity-based for all {len(dynamodb_candidates)} new tables (requested)")
+        return {
+            table["resourceId"]: {"method": RESTORE_METHOD_CAPACITY_BASED, "reasons": []}
+            for table in dynamodb_candidates
+        }
+
+    if requested_method == DYNAMODB_RESTORE_METHOD_IMPORT:
+        # Forced: submit every table as an import and let the API reject the ones
+        # it cannot take, rather than silently restoring them a different way.
+        print(f"\nDynamoDB restore method: ImportTable forced for all {len(dynamodb_candidates)} new tables (requested)")
+        return {
+            table["resourceId"]: {"method": RESTORE_METHOD_IMPORT_TABLE, "reasons": []}
+            for table in dynamodb_candidates
+        }
+
+    # Auto: prefer ImportTable, fall back per table to capacity-based.
+    print(f"\nDynamoDB restore method (auto) for {len(dynamodb_candidates)} new tables:")
+
+    role_version = get_restore_role_version(eon_client, eon_restore_account_id, restore_account_id)
+    parsed_version = parse_role_version(role_version)
+
+    if parsed_version is None or parsed_version < MIN_ROLE_VERSION_FOR_IMPORT:
+        minimum = ".".join(str(part) for part in MIN_ROLE_VERSION_FOR_IMPORT)
+        reason = (f"restore account role version {role_version or 'unknown'} is below "
+                  f"{minimum}, the minimum for ImportTable")
+        print(f"  All tables -> capacity-based: {reason}")
+        return {
+            table["resourceId"]: {"method": RESTORE_METHOD_CAPACITY_BASED, "reasons": [reason]}
+            for table in dynamodb_candidates
+        }
+
+    print(f"  Restore account role version: {role_version}")
+
+    for table in dynamodb_candidates:
+        resource_id = table["resourceId"]
+        resource_name = table["resourceName"]
+        region = table["region"]
+
+        try:
+            availability = eon_client.check_dynamodb_import_availability(
+                snapshot_id=table["snapshotId"],
+                region=region,
+                restored_name=table["restoredName"],
+            )
+        except Exception as e:
+            reason = f"import availability check failed: {e}"
+            print(f"  {resource_name} -> capacity-based: {reason}")
+            plan[resource_id] = {"method": RESTORE_METHOD_CAPACITY_BASED, "reasons": [reason]}
+            continue
+
+        if availability["available"]:
+            print(f"  {resource_name} -> ImportTable")
+            plan[resource_id] = {"method": RESTORE_METHOD_IMPORT_TABLE, "reasons": []}
+            continue
+
+        reasons = [_IMPORT_UNAVAILABLE_REASONS.get(code, code) for code in availability["reasons"]]
+        print(f"  {resource_name} -> capacity-based: {'; '.join(reasons) or 'import not available'}")
+        plan[resource_id] = {"method": RESTORE_METHOD_CAPACITY_BASED, "reasons": reasons}
+
+    import_count = sum(1 for entry in plan.values() if entry["method"] == RESTORE_METHOD_IMPORT_TABLE)
+    print(f"  {import_count} via ImportTable, {len(plan) - import_count} capacity-based")
+
+    return plan
+
+
+# ---------------------------------------------------------------------------
 # DynamoDB WCU allocation
 # ---------------------------------------------------------------------------
 
@@ -208,7 +401,7 @@ def calculate_dynamodb_wcu_allocation_by_region(
     dynamodb_tables_by_region: Dict[str, List[Dict[str, Any]]],
     regional_wcu_capacity: int = 40000,
     utilization_percentage: float = 0.95,
-    default_wcu_for_zero_size: int = 50,
+    default_wcu_for_zero_size: int = 0,
     table_wcu_max: int = 40000,
 ) -> Dict[str, int]:
     """
@@ -218,7 +411,9 @@ def calculate_dynamodb_wcu_allocation_by_region(
         dynamodb_tables_by_region: Dictionary mapping region to list of tables
         regional_wcu_capacity: WCU capacity per region (default 40000)
         utilization_percentage: Percentage of capacity to use (default 95%)
-        default_wcu_for_zero_size: WCU for tables with 0 size (default 50)
+        default_wcu_for_zero_size: WCU for tables reporting 0 bytes (default 0 —
+            there is nothing to write back, so they take no share of the budget
+            and Eon's own minimum capacity applies)
         table_wcu_max: Maximum WCU any single table can receive (default 40000).
             Prevents a single large table from consuming all provisioned capacity
             when the regional limit has been raised above the default.
@@ -276,15 +471,18 @@ def calculate_dynamodb_wcu_allocation_by_region(
                 capped = " (capped)" if proportional_wcu > table_wcu_max else ""
                 print(f"    {table['resourceName']}: {table_size_gb:.2f} GB ({proportion*100:.1f}%) -> {allocated_wcu:,} WCU{capped}")
 
-        # Give zero-size tables the default or whatever remains, whichever is smaller
+        # A table reporting zero bytes has nothing to write back, so it gets no
+        # share of the budget — every WCU it took would come out of a table that
+        # does have data. Eon applies its own minimum capacity to these.
         remaining_wcu = available_wcu - allocated_total
 
         for table in zero_size_tables:
-            allocated_wcu = min(default_wcu_for_zero_size, max(remaining_wcu, 1))
+            allocated_wcu = min(default_wcu_for_zero_size, max(remaining_wcu, 0))
             wcu_allocation[table["resourceId"]] = allocated_wcu
             remaining_wcu -= allocated_wcu
             allocated_total += allocated_wcu
-            print(f"    {table['resourceName']}: 0 GB (no size data) -> {allocated_wcu:,} WCU")
+            print(f"    {table['resourceName']}: 0 GB (no data to write) -> "
+                  f"{allocated_wcu:,} WCU (Eon default applies)")
 
         print(f"    Total allocated in {region}: {allocated_total:,} WCU ({allocated_total/regional_wcu_capacity*100:.1f}% of regional capacity)")
 
@@ -378,6 +576,11 @@ def _scale_up_dynamodb_table_wcu(
     """
     if not credentials:
         print(f"WARNING: No cross-account credentials — cannot scale WCU for {table_name}")
+        return {"wcuScaledUp": False}
+
+    if allocated_wcu <= 0:
+        # Nothing to write back, so the table keeps whatever capacity it has.
+        print(f"Table {table_name} reports no data to restore — leaving its throughput alone")
         return {"wcuScaledUp": False}
 
     try:
@@ -920,6 +1123,7 @@ class _RestoreContext:
     recovery_stack_s3_buckets: Dict[str, Dict[str, str]]
     recovery_stacks_only: bool
     dynamodb_wcu_allocation: Dict[str, int]
+    dynamodb_restore_methods: Dict[str, Dict[str, Any]]
     dynamodb_warm_throughput: bool
     s3_in_place_tag_key: str
 
@@ -1391,7 +1595,7 @@ def _restore_dynamodb_in_place(
         raise ValueError(f"No KMS key available for region {restore_target_region} (required for in-place restore)")
 
     # Scale up table WCU before restore to maximize write throughput
-    allocated_wcu = ctx.dynamodb_wcu_allocation.get(resource_id, 50)
+    allocated_wcu = ctx.dynamodb_wcu_allocation.get(resource_id, 0)
     original_settings = _scale_up_dynamodb_table_wcu(
         table_name=table_name,
         region=restore_target_region,
@@ -1405,13 +1609,17 @@ def _restore_dynamodb_in_place(
         "restoredRegion": restore_target_region,
         "restoredName": table_name,
         "restoreType": "IN_PLACE",
+        # The existing-table restore API takes no restore method — data is always
+        # written through the capacity-based path.
+        "restoreMethod": RESTORE_METHOD_CAPACITY_BASED,
         "recoveryStackName": stack_table_match["stackName"],
         "writeCapacityUnits": allocated_wcu,
         "originalTableSettings": original_settings,
     }
     # Warm throughput is applied by the monitor loop once the table is ACTIVE.
     # DynamoDB pre-allocates partitions asynchronously after the API call.
-    if ctx.dynamodb_warm_throughput:
+    # A table with no data to write back has no partitions worth pre-warming.
+    if ctx.dynamodb_warm_throughput and allocated_wcu > 0:
         restored_resource_details["warmThroughputTarget"] = allocated_wcu
         restored_resource_details["warmThroughputApplied"] = False
 
@@ -1450,8 +1658,11 @@ def _restore_dynamodb_new_table(
     snapshot_id = resource_snapshot["snapshotId"]
     snapshot_point_in_time = resource_snapshot.get("snapshotPointInTime", "Unknown")
 
-    # Get allocated WCU for this table
-    allocated_wcu = ctx.dynamodb_wcu_allocation.get(resource_id, 50)
+    planned = ctx.dynamodb_restore_methods.get(
+        resource_id, {"method": RESTORE_METHOD_CAPACITY_BASED, "reasons": []}
+    )
+    restore_method = planned["method"]
+    use_import = restore_method == RESTORE_METHOD_IMPORT_TABLE
 
     # Merge original tags with restore tags (restore tags take precedence)
     original_tags = resource_snapshot.get("originalTags", {})
@@ -1464,34 +1675,57 @@ def _restore_dynamodb_new_table(
     }
 
     restored_table_name = get_restored_name(resource_name, ctx.resource_name_prefix)
-    print(f"DynamoDB restore config - region: {actual_region}, table: {restored_table_name}, WCU: {allocated_wcu:,}")
 
     destination_config = {
         "awsDynamodb": {
             "restoreRegion": actual_region,
             "encryptionKeyId": kms_key_arn,
             "restoredName": restored_table_name,
-            "writeCapacityUnits": allocated_wcu,
             "tags": dynamodb_tags
         }
     }
-
-    job_id = ctx.eon_client.restore_dynamodb_table(
-        resource_id=resource_id,
-        snapshot_id=snapshot_id,
-        restore_account_id=ctx.eon_restore_account_id,
-        destination_config=destination_config
-    )
 
     restored_resource_details = {
         "restoredRegion": actual_region,
         "restoredName": restored_table_name,
         "restoreType": "NEW_TABLE",
-        "writeCapacityUnits": allocated_wcu,
+        "restoreMethod": restore_method,
     }
-    if ctx.dynamodb_warm_throughput:
-        restored_resource_details["warmThroughputTarget"] = allocated_wcu
-        restored_resource_details["warmThroughputApplied"] = False
+    if planned["reasons"]:
+        restored_resource_details["restoreMethodReasons"] = planned["reasons"]
+
+    if use_import:
+        # ImportTable creates the table from staged S3 data with the source
+        # table's own billing mode and throughput. Write capacity and warm
+        # throughput play no part, and the table does not exist until the
+        # import finishes.
+        print(f"DynamoDB restore config - region: {actual_region}, table: {restored_table_name}, "
+              f"method: ImportTable")
+    else:
+        allocated_wcu = ctx.dynamodb_wcu_allocation.get(resource_id, 0)
+        if allocated_wcu > 0:
+            destination_config["awsDynamodb"]["writeCapacityUnits"] = allocated_wcu
+            restored_resource_details["writeCapacityUnits"] = allocated_wcu
+            print(f"DynamoDB restore config - region: {actual_region}, table: {restored_table_name}, "
+                  f"method: capacity-based, WCU: {allocated_wcu:,}")
+            if ctx.dynamodb_warm_throughput:
+                restored_resource_details["warmThroughputTarget"] = allocated_wcu
+                restored_resource_details["warmThroughputApplied"] = False
+        else:
+            # The table reported no data, so there is nothing to size capacity
+            # for. Omitting writeCapacityUnits lets Eon apply its own minimum,
+            # and there are no partitions worth pre-warming.
+            print(f"DynamoDB restore config - region: {actual_region}, table: {restored_table_name}, "
+                  f"method: capacity-based, WCU: (Eon default — table reports no data)")
+
+    job_id = ctx.eon_client.restore_dynamodb_table(
+        resource_id=resource_id,
+        snapshot_id=snapshot_id,
+        restore_account_id=ctx.eon_restore_account_id,
+        destination_config=destination_config,
+        restore_method=restore_method
+    )
+
     return job_id, restored_resource_details
 
 
@@ -1524,6 +1758,9 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         rdsSubnetGroupsByRegion: Dictionary mapping region to RDS subnet group name
         dynamodbRegionalWcuLimit: Regional WCU limit per region for DynamoDB (default 40000)
         dynamodbTableWcuMax: Max WCU any single table can receive (default 40000)
+        dynamodbRestoreMethod: How new DynamoDB tables are rebuilt — "auto" (default,
+            ImportTable where the snapshot and restore account allow it, capacity-based
+            otherwise), "import" (force ImportTable), or "capacity" (force the write path)
         vpcConfigs: VPC configurations for the restore
         crossAccountRoleArn: ARN of cross-account role (optional)
         excludeEC2TagKeys: List of tag keys to exclude from EC2 instance tags (optional)
@@ -1544,6 +1781,12 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     rds_subnet_groups_by_region = event.get("rdsSubnetGroupsByRegion", {})
     dynamodb_regional_wcu_limit = event.get("dynamodbRegionalWcuLimit") or 40000
     dynamodb_table_wcu_max = event.get("dynamodbTableWcuMax") or 40000
+    dynamodb_restore_method = (event.get("dynamodbRestoreMethod") or DYNAMODB_RESTORE_METHOD_AUTO).strip().lower()
+    if dynamodb_restore_method not in DYNAMODB_RESTORE_METHOD_CHOICES:
+        raise ValueError(
+            f"Invalid dynamodbRestoreMethod '{dynamodb_restore_method}' — "
+            f"expected one of {', '.join(DYNAMODB_RESTORE_METHOD_CHOICES)}"
+        )
     vpc_configs = event.get("vpcConfigs", [])
     cross_account_role_arn = event.get("crossAccountRoleArn")
     management_account_id = os.environ.get("MANAGEMENT_ACCOUNT_ID", "").strip() or None
@@ -1559,6 +1802,7 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     print(f"RDS subnet groups available in regions: {list(rds_subnet_groups_by_region.keys())}")
     print(f"DynamoDB regional WCU limit: {dynamodb_regional_wcu_limit:,}")
     print(f"DynamoDB per-table WCU max: {dynamodb_table_wcu_max:,}")
+    print(f"DynamoDB restore method: {dynamodb_restore_method}")
     print(f"Resource name prefix: {resource_name_prefix if resource_name_prefix else '(none - using original names)'}")
     print(f"DynamoDB warm throughput: {'enabled' if dynamodb_warm_throughput else 'disabled'}")
     if s3_in_place_tag_key != "eon_functional_id":
@@ -1607,48 +1851,6 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         region = config.get("region", restore_region)
         vpc_configs_by_region[region] = config
 
-    # ---- Pre-compute DynamoDB WCU allocation ----
-    # In recoveryStacksOnly mode, only allocate WCU to tables that match a
-    # recovery stack. Otherwise non-restored tables dilute the WCU budget.
-    dynamodb_tables_by_region: Dict[str, List[Dict[str, Any]]] = {}
-    skipped_non_stack = 0
-    for snapshot in resource_snapshots:
-        if snapshot.get("resourceType") == "AWS_DYNAMO_DB":
-            source_region = snapshot.get("region")
-            resource_name = snapshot["resourceName"]
-
-            # In recoveryStacksOnly mode, skip tables without a matching stack
-            if recovery_stacks_only and recovery_stack_tables:
-                if not stack_table_match(recovery_stack_tables, resource_name, source_region):
-                    skipped_non_stack += 1
-                    continue
-
-            target_region = restore_region if restore_region else source_region
-
-            # Determine actual region (same logic as restore section)
-            actual_region = target_region if target_region in vpc_configs_by_region else list(vpc_configs_by_region.keys())[0] if vpc_configs_by_region else None
-
-            if actual_region:
-                if actual_region not in dynamodb_tables_by_region:
-                    dynamodb_tables_by_region[actual_region] = []
-
-                dynamodb_tables_by_region[actual_region].append({
-                    "resourceId": snapshot["resourceId"],
-                    "resourceName": resource_name,
-                    "sizeBytes": snapshot.get("tableSizeBytes", 0)
-                })
-
-    if skipped_non_stack:
-        print(f"WCU allocation: skipped {skipped_non_stack} DynamoDB tables not matching recovery stacks (recoveryStacksOnly mode)")
-
-    dynamodb_wcu_allocation = calculate_dynamodb_wcu_allocation_by_region(
-        dynamodb_tables_by_region=dynamodb_tables_by_region,
-        regional_wcu_capacity=dynamodb_regional_wcu_limit,
-        utilization_percentage=0.95,
-        default_wcu_for_zero_size=50,
-        table_wcu_max=dynamodb_table_wcu_max,
-    )
-
     # ---- Initialize Eon client ----
     credentials = get_eon_credentials()
     eon_client = EonClient(
@@ -1656,6 +1858,82 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         client_id=credentials["clientId"],
         client_secret=credentials["clientSecret"],
         project_id=os.environ["EON_PROJECT_ID"]
+    )
+
+    # ---- Classify DynamoDB tables in scope ----
+    # In recoveryStacksOnly mode, only tables that match a recovery stack are
+    # restored at all; the rest are dropped here so they neither get a restore
+    # method nor dilute the WCU budget.
+    dynamodb_in_scope: List[Dict[str, Any]] = []
+    skipped_non_stack = 0
+    for snapshot in resource_snapshots:
+        if snapshot.get("resourceType") != "AWS_DYNAMO_DB":
+            continue
+
+        source_region = snapshot.get("region")
+        resource_name = snapshot["resourceName"]
+
+        matched_stack_table = None
+        if recovery_stack_tables:
+            matched_stack_table = stack_table_match(recovery_stack_tables, resource_name, source_region)
+        if recovery_stacks_only and recovery_stack_tables and not matched_stack_table:
+            skipped_non_stack += 1
+            continue
+
+        target_region = restore_region if restore_region else source_region
+
+        # Determine actual region (same logic as restore section)
+        actual_region = target_region if target_region in vpc_configs_by_region else list(vpc_configs_by_region.keys())[0] if vpc_configs_by_region else None
+
+        if not actual_region:
+            continue
+
+        dynamodb_in_scope.append({
+            "resourceId": snapshot["resourceId"],
+            "resourceName": resource_name,
+            "restoredName": get_restored_name(resource_name, resource_name_prefix),
+            "snapshotId": snapshot["snapshotId"],
+            # In-place restores go into the stack table's region, which can differ
+            # from the region a new table would be created in.
+            "region": matched_stack_table["region"] if matched_stack_table else actual_region,
+            "sizeBytes": snapshot.get("tableSizeBytes", 0),
+            "inPlace": bool(matched_stack_table),
+        })
+
+    if skipped_non_stack:
+        print(f"DynamoDB: skipped {skipped_non_stack} tables not matching recovery stacks (recoveryStacksOnly mode)")
+
+    # ---- Choose a restore method per new table ----
+    dynamodb_restore_methods = plan_dynamodb_restore_methods(
+        eon_client=eon_client,
+        dynamodb_candidates=[table for table in dynamodb_in_scope if not table["inPlace"]],
+        requested_method=dynamodb_restore_method,
+        eon_restore_account_id=eon_restore_account_id,
+        restore_account_id=restore_account_id,
+    )
+
+    # ---- Pre-compute DynamoDB WCU allocation ----
+    # ImportTable restores create the table from staged S3 data and never touch
+    # the account's write capacity, so they are left out of the budget — including
+    # them would starve the tables that do write through the DynamoDB API.
+    dynamodb_tables_by_region: Dict[str, List[Dict[str, Any]]] = {}
+    for table in dynamodb_in_scope:
+        planned = dynamodb_restore_methods.get(table["resourceId"], {})
+        if planned.get("method") == RESTORE_METHOD_IMPORT_TABLE:
+            continue
+
+        dynamodb_tables_by_region.setdefault(table["region"], []).append({
+            "resourceId": table["resourceId"],
+            "resourceName": table["resourceName"],
+            "sizeBytes": table["sizeBytes"],
+        })
+
+    dynamodb_wcu_allocation = calculate_dynamodb_wcu_allocation_by_region(
+        dynamodb_tables_by_region=dynamodb_tables_by_region,
+        regional_wcu_capacity=dynamodb_regional_wcu_limit,
+        utilization_percentage=0.95,
+        default_wcu_for_zero_size=0,
+        table_wcu_max=dynamodb_table_wcu_max,
     )
 
     # ---- Build shared context ----
@@ -1674,6 +1952,7 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         recovery_stack_s3_buckets=recovery_stack_s3_buckets,
         recovery_stacks_only=recovery_stacks_only,
         dynamodb_wcu_allocation=dynamodb_wcu_allocation,
+        dynamodb_restore_methods=dynamodb_restore_methods,
         dynamodb_warm_throughput=dynamodb_warm_throughput,
         s3_in_place_tag_key=s3_in_place_tag_key,
     )

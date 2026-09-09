@@ -1,0 +1,6 @@
+-r src/requirements.txt
+
+pytest>=8.0.0
+pytest-cov>=5.0.0
+responses>=0.25.0
+moto[cloudformation,dynamodb,ec2,iam,rds,s3,secretsmanager,sns,sts]>=5.0.0

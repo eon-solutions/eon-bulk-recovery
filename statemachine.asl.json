@@ -1,7 +1,25 @@
 {
   "Comment": "Eon Bulk Recovery Workflow - Orchestrates the recovery of all resources from a source account to a restore account",
-  "StartAt": "Bootstrap Restore Account",
+  "StartAt": "Apply Input Defaults",
   "States": {
+    "Apply Input Defaults": {
+      "Type": "Pass",
+      "Comment": "Defaults for optional execution-input keys the state machine references by path",
+      "Result": {
+        "dynamodbRestoreMethod": "auto"
+      },
+      "ResultPath": "$.inputDefaults",
+      "Next": "Normalize Input"
+    },
+    "Normalize Input": {
+      "Type": "Pass",
+      "Comment": "Caller-supplied values win over the defaults",
+      "Parameters": {
+        "merged.$": "States.JsonMerge($.inputDefaults, $, false)"
+      },
+      "OutputPath": "$.merged",
+      "Next": "Bootstrap Restore Account"
+    },
     "Bootstrap Restore Account": {
       "Type": "Task",
       "Resource": "${BootstrapFunctionArn}",
@@ -16,7 +34,10 @@
       "ResultPath": "$.bootstrapResult",
       "Retry": [
         {
-          "ErrorEquals": ["States.TaskFailed", "States.Timeout"],
+          "ErrorEquals": [
+            "States.TaskFailed",
+            "States.Timeout"
+          ],
           "IntervalSeconds": 30,
           "MaxAttempts": 3,
           "BackoffRate": 2.0
@@ -24,7 +45,9 @@
       ],
       "Catch": [
         {
-          "ErrorEquals": ["States.ALL"],
+          "ErrorEquals": [
+            "States.ALL"
+          ],
           "ResultPath": "$.error",
           "Next": "Bootstrap Failed"
         }
@@ -49,7 +72,10 @@
       "ResultPath": "$.connectResult",
       "Retry": [
         {
-          "ErrorEquals": ["States.TaskFailed", "States.Timeout"],
+          "ErrorEquals": [
+            "States.TaskFailed",
+            "States.Timeout"
+          ],
           "IntervalSeconds": 30,
           "MaxAttempts": 3,
           "BackoffRate": 2.0
@@ -57,7 +83,9 @@
       ],
       "Catch": [
         {
-          "ErrorEquals": ["States.ALL"],
+          "ErrorEquals": [
+            "States.ALL"
+          ],
           "ResultPath": "$.error",
           "Next": "Connect Account Failed"
         }
@@ -81,7 +109,10 @@
       "ResultPath": "$.vpcConfigResult",
       "Retry": [
         {
-          "ErrorEquals": ["States.TaskFailed", "States.Timeout"],
+          "ErrorEquals": [
+            "States.TaskFailed",
+            "States.Timeout"
+          ],
           "IntervalSeconds": 30,
           "MaxAttempts": 3,
           "BackoffRate": 2.0
@@ -89,7 +120,9 @@
       ],
       "Catch": [
         {
-          "ErrorEquals": ["States.ALL"],
+          "ErrorEquals": [
+            "States.ALL"
+          ],
           "ResultPath": "$.error",
           "Next": "Configure VPC Failed"
         }
@@ -114,7 +147,10 @@
       "ResultPath": "$.resourcesResult",
       "Retry": [
         {
-          "ErrorEquals": ["States.TaskFailed", "States.Timeout"],
+          "ErrorEquals": [
+            "States.TaskFailed",
+            "States.Timeout"
+          ],
           "IntervalSeconds": 30,
           "MaxAttempts": 3,
           "BackoffRate": 2.0
@@ -122,7 +158,9 @@
       ],
       "Catch": [
         {
-          "ErrorEquals": ["States.ALL"],
+          "ErrorEquals": [
+            "States.ALL"
+          ],
           "ResultPath": "$.error",
           "Next": "List Resources Failed"
         }
@@ -147,7 +185,10 @@
       "ResultPath": "$.snapshotsResult",
       "Retry": [
         {
-          "ErrorEquals": ["States.TaskFailed", "States.Timeout"],
+          "ErrorEquals": [
+            "States.TaskFailed",
+            "States.Timeout"
+          ],
           "IntervalSeconds": 30,
           "MaxAttempts": 3,
           "BackoffRate": 2.0
@@ -155,7 +196,9 @@
       ],
       "Catch": [
         {
-          "ErrorEquals": ["States.ALL"],
+          "ErrorEquals": [
+            "States.ALL"
+          ],
           "ResultPath": "$.error",
           "Next": "Get Snapshots Failed"
         }
@@ -198,6 +241,7 @@
         "rdsSubnetGroupsByRegion.$": "$.bootstrapResult.rdsSubnetGroupsByRegion",
         "dynamodbRegionalWcuLimit.$": "$.dynamodbRegionalWcuLimit",
         "dynamodbTableWcuMax.$": "$.dynamodbTableWcuMax",
+        "dynamodbRestoreMethod.$": "$.dynamodbRestoreMethod",
         "resourceNamePrefix.$": "$.resourceNamePrefix",
         "vpcConfigs.$": "$.vpcConfigs",
         "crossAccountRoleArn.$": "$.crossAccountRoleArn",
@@ -209,7 +253,10 @@
       "ResultPath": "$.restoreJobsResult",
       "Retry": [
         {
-          "ErrorEquals": ["States.TaskFailed", "States.Timeout"],
+          "ErrorEquals": [
+            "States.TaskFailed",
+            "States.Timeout"
+          ],
           "IntervalSeconds": 30,
           "MaxAttempts": 3,
           "BackoffRate": 2.0
@@ -217,7 +264,9 @@
       ],
       "Catch": [
         {
-          "ErrorEquals": ["States.ALL"],
+          "ErrorEquals": [
+            "States.ALL"
+          ],
           "ResultPath": "$.error",
           "Next": "Initiate Restores Failed"
         }
@@ -269,7 +318,10 @@
       "ResultPath": "$.monitoringState",
       "Retry": [
         {
-          "ErrorEquals": ["States.TaskFailed", "States.Timeout"],
+          "ErrorEquals": [
+            "States.TaskFailed",
+            "States.Timeout"
+          ],
           "IntervalSeconds": 30,
           "MaxAttempts": 3,
           "BackoffRate": 2.0
@@ -277,7 +329,9 @@
       ],
       "Catch": [
         {
-          "ErrorEquals": ["States.ALL"],
+          "ErrorEquals": [
+            "States.ALL"
+          ],
           "ResultPath": "$.error",
           "Next": "Monitor Jobs Failed"
         }

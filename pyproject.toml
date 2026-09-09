@@ -1,0 +1,25 @@
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = [
+    "--strict-markers",
+    "--cov=src",
+    "--cov-report=term-missing",
+    "--cov-report=xml",
+    "--cov-fail-under=98",
+]
+filterwarnings = ["error::DeprecationWarning:handlers.*", "error::DeprecationWarning:lib.*"]
+
+[tool.coverage.run]
+branch = true
+source = ["src"]
+omit = ["src/handlers/__init__.py"]
+
+[tool.coverage.report]
+show_missing = true
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+]

@@ -4,7 +4,7 @@ import os
 import sys
 import json
 from typing import Dict, Any, List
-from datetime import datetime
+from datetime import datetime, timezone
 import boto3
 
 # Add parent directory to path for imports
@@ -23,6 +23,7 @@ from lib.aws_utils import get_eon_credentials, get_cross_account_credentials, cr
 _SUCCESS_STATUSES = {"JOB_COMPLETED"}
 _PARTIAL_STATUSES = {"JOB_PARTIAL"}
 _FAILED_STATUSES = {"JOB_FAILED", "JOB_CANCELED", "JOB_REJECTED"}
+_REJECTED_STATUSES = {"JOB_REJECTED"}
 _SKIPPED_STATUSES = {"JOB_SKIPPED"}
 _RUNNING_STATUSES = {"JOB_PENDING", "JOB_RUNNING"}
 
@@ -30,6 +31,12 @@ _RUNNING_STATUSES = {"JOB_PENDING", "JOB_RUNNING"}
 # restoration for in-place restores — a rejected/skipped in-place job must also
 # have its temporarily-elevated WCU rolled back, not left stuck.
 _TERMINAL_STATUSES = _SUCCESS_STATUSES | _PARTIAL_STATUSES | _FAILED_STATUSES | _SKIPPED_STATUSES
+
+# How each DynamoDB restore method reads in the completion notification.
+_DYNAMODB_METHOD_LABELS = {
+    "RESTORE_METHOD_IMPORT_TABLE": "ImportTable (import from S3)",
+    "RESTORE_METHOD_CAPACITY_BASED": "capacity-based",
+}
 
 
 def _apply_deferred_warm_throughput(
@@ -289,6 +296,7 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     # Track job statuses
     completed_count = 0
     failed_count = 0
+    rejected_count = 0
     running_count = 0
     partial_count = 0
     skipped_count = 0
@@ -334,6 +342,10 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                 "resourceType": job.get("resourceType"),
                 "currentStatus": status,
                 "statusMessage": status_message,
+                # Eon's machine-readable cause (e.g. INSUFFICIENT_ENCRYPTION_PERMISSIONS).
+                # It is the part that says what to actually go and fix, so it has to
+                # reach the notification rather than being dropped here.
+                "errorCode": job_execution.get("errorCode", ""),
                 "startTime": job_execution.get("startTime"),
                 "endTime": job_execution.get("endTime"),
                 "durationSeconds": job_execution.get("durationSeconds")
@@ -344,6 +356,12 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                 completed_count += 1
             elif status in _FAILED_STATUSES:
                 failed_count += 1
+                # Rejected means Eon refused to start the job at all — a
+                # precondition problem (usually permissions), not a restore that
+                # ran and failed. Counted within failures for pass/fail, but
+                # reported separately because the remediation is different.
+                if status in _REJECTED_STATUSES:
+                    rejected_count += 1
             elif status in _PARTIAL_STATUSES:
                 partial_count += 1
                 # Treat partial as a type of completion for decision purposes
@@ -397,7 +415,9 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     all_complete = (running_count == 0)
     timed_out = iteration >= max_iterations
 
-    print(f"Job summary: {completed_count} completed, {failed_count} failed, {partial_count} partial, {skipped_count} skipped, {running_count} still running")
+    rejected_note = f" (of which {rejected_count} rejected)" if rejected_count else ""
+    print(f"Job summary: {completed_count} completed, {failed_count} failed{rejected_note}, "
+          f"{partial_count} partial, {skipped_count} skipped, {running_count} still running")
 
     result = {
         "restoreJobs": restore_jobs,  # Pass through for next iteration
@@ -410,6 +430,7 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         "jobStatuses": job_statuses,
         "completedJobs": completed_count,
         "failedJobs": failed_count,
+        "rejectedJobs": rejected_count,
         "partialJobs": partial_count,
         "skippedJobs": skipped_count,
         "runningJobs": running_count,
@@ -449,6 +470,11 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     return result
 
 
+def _rejected_note(rejected_jobs: int) -> str:
+    """Call out rejections inside a failure count — they need different remediation."""
+    return f", {rejected_jobs} of them rejected before starting" if rejected_jobs else ""
+
+
 def send_completion_notification(job_summary: Dict[str, Any], timeout: bool) -> None:
     """
     Send SNS notification about bulk recovery completion.
@@ -473,6 +499,7 @@ def send_completion_notification(job_summary: Dict[str, Any], timeout: bool) -> 
     failed_jobs = job_summary["failedJobs"]
     partial_jobs = job_summary["partialJobs"]
     skipped_jobs = job_summary.get("skippedJobs", 0)
+    rejected_jobs = job_summary.get("rejectedJobs", 0)
     running_jobs = job_summary["runningJobs"]
     no_snapshot_resources = job_summary.get("resourcesWithoutSnapshots", [])
     no_snapshot_count = job_summary.get("resourcesWithoutSnapshotsCount", len(no_snapshot_resources))
@@ -489,8 +516,9 @@ def send_completion_notification(job_summary: Dict[str, Any], timeout: bool) -> 
     if start_time_str:
         try:
             start_time = datetime.fromisoformat(start_time_str.replace('Z', '+00:00'))
-            end_time = datetime.utcnow()
-            duration = end_time - start_time.replace(tzinfo=None)
+            if start_time.tzinfo is None:
+                start_time = start_time.replace(tzinfo=timezone.utc)
+            duration = datetime.now(timezone.utc) - start_time
             hours = int(duration.total_seconds() // 3600)
             minutes = int((duration.total_seconds() % 3600) // 60)
             duration_str = f"{hours}h {minutes}m"
@@ -510,10 +538,18 @@ def send_completion_notification(job_summary: Dict[str, Any], timeout: bool) -> 
                           f"{no_snapshot_count} resource(s) had no snapshot to restore from")
     elif completed_jobs > 0 or skipped_jobs > 0:
         subject = "Eon Bulk Recovery - PARTIAL SUCCESS"
-        status_summary = f"⚠️ {completed_jobs}/{total_jobs} jobs completed ({failed_jobs} failed, {partial_jobs} partial, {skipped_jobs} skipped)"
+        status_summary = (f"⚠️ {completed_jobs}/{total_jobs} jobs completed "
+                          f"({failed_jobs} failed{_rejected_note(rejected_jobs)}, "
+                          f"{partial_jobs} partial, {skipped_jobs} skipped)")
+    elif rejected_jobs == total_jobs:
+        # Eon refused to start any of them. Nothing ran, so this is a
+        # precondition problem to fix and re-run, not a restore that broke.
+        subject = "Eon Bulk Recovery - REJECTED"
+        status_summary = (f"⛔ All {total_jobs} restore jobs were rejected before they started. "
+                          f"Nothing was restored. See the reasons below, fix them, and re-run.")
     else:
         subject = "Eon Bulk Recovery - FAILURE"
-        status_summary = f"❌ All {total_jobs} restore jobs failed"
+        status_summary = f"❌ All {total_jobs} restore jobs failed{_rejected_note(rejected_jobs)}"
 
     # Format VPC configuration summary (multi-region support)
     vpc_summary_lines = []
@@ -560,6 +596,7 @@ def send_completion_notification(job_summary: Dict[str, Any], timeout: bool) -> 
         f"Total Jobs: {total_jobs}",
         f"Completed: {completed_jobs}",
         f"Failed: {failed_jobs}",
+        f"  of which rejected before starting: {rejected_jobs}",
         f"Partial: {partial_jobs}",
         f"Skipped: {skipped_jobs}",
         f"Still Running: {running_jobs}",
@@ -655,11 +692,19 @@ def send_completion_notification(job_summary: Dict[str, Any], timeout: bool) -> 
 
             elif resource_type == "AWS_DYNAMO_DB":
                 restored_name = restore_job.get("restoredName")
+                restore_method = restore_job.get("restoreMethod")
                 wcu = restore_job.get("writeCapacityUnits")
                 if restored_name:
                     message_lines.append(f"   Restored Name: {restored_name}")
+                if restore_method:
+                    message_lines.append(
+                        f"   Restore Method: {_DYNAMODB_METHOD_LABELS.get(restore_method, restore_method)}"
+                    )
                 if wcu:
                     message_lines.append(f"   Write Capacity Units: {wcu:,}")
+
+        if job_status.get("errorCode"):
+            message_lines.append(f"   Error Code: {job_status['errorCode']}")
 
         if job_status.get("statusMessage"):
             message_lines.append(f"   Message: {job_status['statusMessage']}")
