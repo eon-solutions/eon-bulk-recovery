@@ -57,9 +57,14 @@ def aws(monkeypatch, sts_credentials):
     )
 
     template = MagicMock()
-    template.text = "AWSTemplateFormatVersion: '2010-09-09'"
+    template.text = (
+        "AWSTemplateFormatVersion: '2010-09-09'\n"
+        "      Tags:\n"
+        '        - Key: "eon:cf_version"\n'
+        '          Value: "1.19.1"\n'
+    )
     template.raise_for_status.return_value = None
-    monkeypatch.setattr(bootstrap.requests, "get", lambda url: template)
+    monkeypatch.setattr(bootstrap.requests, "get", lambda url, **kwargs: template)
 
     clients["_template_response"] = template
     return clients
@@ -119,16 +124,29 @@ class TestExtractRoleArn:
         assert bootstrap._extract_role_arn(cfn, "stack", RESTORE_ACCOUNT) == ROLE_ARN
 
 
+class TestTemplateVersion:
+    def test_reads_the_cf_version_tag(self):
+        body = 'Tags:\n  - Key: "eon:cf_version"\n    Value: "1.19.1"\n  - Key: "eon:stack_id"\n'
+
+        assert bootstrap._template_version(body) == "1.19.1"
+
+    def test_is_unknown_when_the_tag_is_absent(self):
+        assert bootstrap._template_version("AWSTemplateFormatVersion: '2010-09-09'") == "unknown"
+
+
 class TestCreateRestoreStack:
     def test_creates_waits_and_returns_the_arn(self):
         cfn = MagicMock()
         cfn.describe_stacks.return_value = {"Stacks": [{"Outputs": []}]}
 
-        arn = bootstrap._create_restore_stack(cfn, "stack", "body", "eon-account", RESTORE_ACCOUNT)
+        arn = bootstrap._create_restore_stack(cfn, "stack", TEMPLATE_URL, "eon-account", RESTORE_ACCOUNT)
 
         create = cfn.create_stack.call_args.kwargs
         assert create["StackName"] == "stack"
-        assert create["TemplateBody"] == "body"
+        # By URL, never inline: CreateStack caps TemplateBody at 51,200 bytes and
+        # the published template is larger than that.
+        assert create["TemplateURL"] == TEMPLATE_URL
+        assert "TemplateBody" not in create
         assert create["Parameters"] == [{"ParameterKey": "EonAccountId", "ParameterValue": "eon-account"}]
         assert create["Capabilities"] == ["CAPABILITY_NAMED_IAM"]
         assert {"Key": "ManagedBy", "Value": "EonBulkRecovery"} in create["Tags"]
@@ -218,6 +236,44 @@ class TestHandlerStack:
 
         with pytest.raises(requests.HTTPError):
             bootstrap.handler({"restoreAccountId": RESTORE_ACCOUNT}, None)
+
+    def test_a_template_over_the_inline_limit_still_deploys(self, aws):
+        # CreateStack rejects an inline TemplateBody over 51,200 bytes and the
+        # published template is larger than that, so the body must never be sent.
+        aws["_template_response"].text = "x" * 60_000
+        cfn = aws["cloudformation:us-east-1"]
+        cfn.describe_stacks.return_value = {"Stacks": [{"Outputs": []}]}
+        kms_not_found(aws)
+
+        bootstrap.handler({"restoreAccountId": RESTORE_ACCOUNT}, None)
+
+        create = cfn.create_stack.call_args.kwargs
+        assert create["TemplateURL"] == TEMPLATE_URL
+        assert "TemplateBody" not in create
+
+    def test_the_log_names_the_template_version_being_installed(self, aws, capsys):
+        aws["cloudformation:us-east-1"].describe_stacks.return_value = {"Stacks": [{"Outputs": []}]}
+        kms_not_found(aws)
+
+        bootstrap.handler({"restoreAccountId": RESTORE_ACCOUNT}, None)
+
+        assert "restore-account template 1.19.1" in capsys.readouterr().out
+
+    def test_the_template_download_cannot_hang_the_step(self, aws, monkeypatch):
+        seen = {}
+
+        def get(url, **kwargs):
+            seen.update(kwargs, url=url)
+            return aws["_template_response"]
+
+        monkeypatch.setattr(bootstrap.requests, "get", get)
+        aws["cloudformation:us-east-1"].describe_stacks.return_value = {"Stacks": [{"Outputs": []}]}
+        kms_not_found(aws)
+
+        bootstrap.handler({"restoreAccountId": RESTORE_ACCOUNT}, None)
+
+        assert seen["url"] == TEMPLATE_URL
+        assert seen["timeout"] == 30
 
     def test_the_management_account_id_is_passed_to_credential_resolution(
         self, aws, monkeypatch, sts_credentials

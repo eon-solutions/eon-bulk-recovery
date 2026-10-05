@@ -1,6 +1,7 @@
 """Lambda handler for bootstrapping the restore account."""
 
 import os
+import re
 import sys
 import json
 from typing import Dict, Any
@@ -12,6 +13,20 @@ from botocore.exceptions import ClientError
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from lib.aws_utils import get_cross_account_credentials
+
+# Eon publishes the current restore-account template here; the console hands the
+# same URL to customers onboarding by hand.
+RESTORE_ACCOUNT_TEMPLATE_URL = (
+    "https://eon-public-b2b628cc-1d96-4fda-8dae-c3b1ad3ea03b.s3.amazonaws.com/restore-account.yml"
+)
+
+_CF_VERSION_TAG = re.compile(r'Key:\s*"eon:cf_version"\s*\n\s*Value:\s*"([^"]+)"')
+
+
+def _template_version(template_body: str) -> str:
+    """Return the eon:cf_version the template stamps on its role, or 'unknown'."""
+    match = _CF_VERSION_TAG.search(template_body)
+    return match.group(1) if match else "unknown"
 
 
 def ensure_rds_service_linked_role(credentials: Dict[str, Any]) -> None:
@@ -59,14 +74,19 @@ def _extract_role_arn(cfn_client, stack_name: str, restore_account_id: str) -> s
 def _create_restore_stack(
     cfn_client,
     stack_name: str,
-    template_body: str,
+    template_url: str,
     eon_account_id: str,
     restore_account_id: str,
 ) -> str:
-    """Create the Eon restore-account IAM stack, wait for completion, and return the role ARN."""
+    """Create the Eon restore-account IAM stack, wait for completion, and return the role ARN.
+
+    The template goes to CloudFormation by URL, never inline: CreateStack caps an
+    inline TemplateBody at 51,200 bytes and Eon's published restore-account.yml
+    is larger than that. A template read from S3 by URL may be up to 1 MB.
+    """
     cfn_client.create_stack(
         StackName=stack_name,
-        TemplateBody=template_body,
+        TemplateURL=template_url,
         Parameters=[
             {"ParameterKey": "EonAccountId", "ParameterValue": eon_account_id}
         ],
@@ -155,19 +175,22 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     # 1. Deploy IAM CloudFormation stack
     stack_name = f"eon-restore-account-{restore_account_id}"
 
-    # Fetch the latest version of the restore account template
-    template_url = "https://eon-public-b2b628cc-1d96-4fda-8dae-c3b1ad3ea03b.s3.amazonaws.com/restore-account.yml"
-    print(f"Fetching latest restore account template from: {template_url}")
+    # CloudFormation reads the template straight from Eon's bucket (see
+    # _create_restore_stack). This download is a pre-flight: an unreachable or
+    # withdrawn template fails the step here with an HTTP error rather than
+    # inside CloudFormation, and the log names the role version being installed.
+    template_url = RESTORE_ACCOUNT_TEMPLATE_URL
+    print(f"Checking the published restore account template at: {template_url}")
 
-    template_response = requests.get(template_url)
+    template_response = requests.get(template_url, timeout=30)
     template_response.raise_for_status()
-    template_body = template_response.text
+    template_version = _template_version(template_response.text)
 
-    print(f"Deploying IAM CloudFormation stack: {stack_name}")
+    print(f"Deploying IAM CloudFormation stack: {stack_name} (restore-account template {template_version})")
 
     try:
         role_arn = _create_restore_stack(
-            cfn_client, stack_name, template_body, eon_account_id, restore_account_id
+            cfn_client, stack_name, template_url, eon_account_id, restore_account_id
         )
 
     except ClientError as e:

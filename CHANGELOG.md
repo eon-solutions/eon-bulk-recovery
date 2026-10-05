@@ -5,6 +5,19 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **Bootstrapping a new restore account failed with a CloudFormation `ValidationError` on
+  `templateBody`.** `CreateStack` accepts at most 51,200 bytes of inline template, and Eon's
+  published restore-account template is now larger than that. Bootstrap now gives CloudFormation
+  the template's URL instead of its contents, which raises the limit to 1 MB. Restore accounts
+  that already have an `eon-restore-account-<id>` stack were not affected, because bootstrap
+  reuses the existing stack. No change to the execution input, the template parameters, or the
+  cross-account role is needed; redeploy the application. The bootstrap log now also names the
+  version of the template it installs, and the template download times out after 30 seconds.
+
 ## [1.2.0] - 2026-09-09
 
 ### Added
