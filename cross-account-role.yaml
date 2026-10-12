@@ -13,6 +13,10 @@ Description: >-
 # The Eon Bulk Recovery Lambda (running in the backup/deployment account) assumes
 # THIS role and, under its credentials, performs only the orchestration steps the
 # script itself runs in the restore account:
+#   * resolve_vpc_configs -> when vpcConfigs names a VPC, subnet, or security
+#                         group, look that name up (DescribeVpcs, DescribeSubnets,
+#                         DescribeSecurityGroups). Values that are already IDs
+#                         are not looked up.
 #   * bootstrap        -> deploy Eon's restore-account.yml stack (creates the
 #                         EonRestore* IAM roles/policies), create per-region KMS
 #                         keys, create RDS DB subnet groups
@@ -307,6 +311,19 @@ Resources:
                 Effect: Allow
                 Action:
                   - ec2:DescribeInstanceTypeOfferings
+                Resource: '*'
+
+              # resolve_vpc_configs: vpcConfigs may name a VPC, subnet, or
+              # security group instead of passing its ID. Names are matched on
+              # the Name tag (and, for security groups, GroupName). These
+              # describe APIs do not support resource-level permissions. A
+              # config that already uses IDs never calls them.
+              - Sid: VpcNameResolution
+                Effect: Allow
+                Action:
+                  - ec2:DescribeVpcs
+                  - ec2:DescribeSubnets
+                  - ec2:DescribeSecurityGroups
                 Resource: '*'
 
               # -------------------------------------------------------------

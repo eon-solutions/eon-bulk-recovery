@@ -6,6 +6,7 @@ import index
 
 
 ALL_STEPS = [
+    "resolve_vpc_configs",
     "bootstrap",
     "connect_account",
     "configure_vpc",

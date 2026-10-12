@@ -10,6 +10,7 @@ from handlers import list_resources
 from handlers import get_snapshots
 from handlers import initiate_restores
 from handlers import monitor_jobs
+from handlers import resolve_vpc_configs
 
 
 def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
@@ -18,7 +19,7 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
 
     Event structure:
     {
-        "step": "bootstrap|connect_account|configure_vpc|list_resources|get_snapshots|initiate_restores|monitor_jobs",
+        "step": "resolve_vpc_configs|bootstrap|connect_account|configure_vpc|list_resources|get_snapshots|initiate_restores|monitor_jobs",
         ... (step-specific parameters)
     }
     """
@@ -30,7 +31,9 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     print(f"Executing step: {step}")
 
     # Route to appropriate handler
-    if step == "bootstrap":
+    if step == "resolve_vpc_configs":
+        return resolve_vpc_configs.handler(event, context)
+    elif step == "bootstrap":
         return bootstrap.handler(event, context)
     elif step == "connect_account":
         return connect_account.handler(event, context)

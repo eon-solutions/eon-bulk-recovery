@@ -189,6 +189,7 @@ Resources:
       Role: !GetAtt StepFunctionsExecutionRole.Arn
       DefinitionUri: ./statemachine.asl.json
       DefinitionSubstitutions:
+        ResolveVpcConfigsFunctionArn: !GetAtt BulkRecoveryFunction.Arn
         BootstrapFunctionArn: !GetAtt BulkRecoveryFunction.Arn
         ConnectAccountFunctionArn: !GetAtt BulkRecoveryFunction.Arn
         ConfigureVpcFunctionArn: !GetAtt BulkRecoveryFunction.Arn
