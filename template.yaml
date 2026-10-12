@@ -76,7 +76,7 @@ Resources:
   LambdaExecutionRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: EonBulkRecoveryLambdaRole
+      RoleName: !Sub '${AWS::StackName}-lambda-role'
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -162,7 +162,7 @@ Resources:
   StepFunctionsExecutionRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: EonBulkRecoveryStepFunctionsRole
+      RoleName: !Sub '${AWS::StackName}-step-functions-role'
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:

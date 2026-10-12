@@ -8,6 +8,14 @@ Parameters:
     AllowedPattern: '^\d{12}$'
     ConstraintDescription: Must be a valid 12-digit AWS account ID
 
+  LambdaExecutionRoleName:
+    Type: String
+    Description: >-
+      Name of the Lambda execution role in the backup account that may assume this
+      role. The application names that role ${StackName}-lambda-role, so the
+      eon-bulk-recovery stack uses eon-bulk-recovery-lambda-role.
+    Default: eon-bulk-recovery-lambda-role
+
 Resources:
   EonBulkRecoveryChainRole:
     Type: AWS::IAM::Role
@@ -19,7 +27,7 @@ Resources:
         Statement:
           - Effect: Allow
             Principal:
-              AWS: !Sub 'arn:aws:iam::${BackupAccountId}:role/EonBulkRecoveryLambdaRole'
+              AWS: !Sub 'arn:aws:iam::${BackupAccountId}:role/${LambdaExecutionRoleName}'
             Action: sts:AssumeRole
       Policies:
         - PolicyName: OrganizationAccountAccessPolicy
