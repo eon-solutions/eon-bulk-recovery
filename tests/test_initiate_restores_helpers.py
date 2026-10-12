@@ -296,7 +296,7 @@ class TestWcuAllocation:
 
         assert allocation == {"a": 38000, "b": 38000}
 
-    def test_every_sized_table_gets_at_least_one_wcu(self):
+    def test_every_sized_table_gets_at_least_ten_wcu(self):
         tables = [table("big", "big", 1000)] + [
             {"resourceId": f"t{i}", "resourceName": f"t{i}", "sizeBytes": 1} for i in range(5)
         ]
@@ -305,7 +305,7 @@ class TestWcuAllocation:
             {"us-east-1": tables}, regional_wcu_capacity=40000
         )
 
-        assert all(value >= 1 for value in allocation.values())
+        assert all(value >= 10 for value in allocation.values())
 
     def test_many_empty_tables_never_dilute_the_budget(self):
         tables = [table("a", "orders", 30)] + [

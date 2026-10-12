@@ -462,7 +462,7 @@ def calculate_dynamodb_wcu_allocation_by_region(
             for table in dynamodb_tables:
                 proportion = table["sizeBytes"] / total_size
                 proportional_wcu = int(available_wcu * proportion)
-                allocated_wcu = min(max(proportional_wcu, 1), table_wcu_max)
+                allocated_wcu = min(max(proportional_wcu, 10), table_wcu_max)
 
                 wcu_allocation[table["resourceId"]] = allocated_wcu
                 allocated_total += allocated_wcu
