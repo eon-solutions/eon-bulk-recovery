@@ -7,7 +7,8 @@ Automated disaster recovery application for AWS resources backed up by Eon. Uses
 
 ```mermaid
 flowchart TD
-    A[Bootstrap Restore Account] --> B[Connect Restore Account]
+    R[Resolve VPC Configs] --> A[Bootstrap Restore Account]
+    A --> B[Connect Restore Account]
     B --> C[Configure VPC]
     C --> D[List Resources]
     D --> E[Get Snapshots]
@@ -85,9 +86,10 @@ creates those roles/policies/instance profile — including `iam:PassRole`, whic
 AWS requires to attach the node role to its instance profile), KMS (per-region
 keys + aliases),
 RDS (subnet groups + instance-class availability), S3 (create destination
-buckets, read recovery-bucket tags), EC2 (`DescribeInstanceTypeOfferings`), and
-DynamoDB (`DescribeTable`, `UpdateTable`, `TagResource`, `UntagResource`,
-`ListTagsOfResource` for in-place WCU scaling).
+buckets, read recovery-bucket tags), EC2 (`DescribeVpcs`, `DescribeSubnets`,
+and `DescribeSecurityGroups` to resolve names in `vpcConfigs`, plus
+`DescribeInstanceTypeOfferings`), and DynamoDB (`DescribeTable`, `UpdateTable`,
+`TagResource`, `UntagResource`, `ListTagsOfResource` for in-place WCU scaling).
 
 The role does **not** carry data-plane restore permissions (`ec2:RunInstances`,
 `rds:RestoreDB*`, S3/DynamoDB writes). Those belong to Eon's `EonRestoreAccountRole` /
@@ -203,6 +205,36 @@ aws stepfunctions start-execution \
 }
 ```
 
+`vpc`, each `subnetId`, and the security group entries take either a resource ID
+or the name the account was created with. A name is the resource's `Name` tag.
+A security group also matches its group name. The workflow resolves names to IDs
+in the restore account before bootstrap. A value that is already an ID (`vpc-`,
+`subnet-`, `sg-`) is kept as that ID. A subnet name is matched inside that VPC
+and the availability zone listed beside it. If a name matches nothing, or more
+than one resource, the step fails and the error lists what it found.
+
+```json
+"vpcConfigs": [{
+  "region": "us-east-1",
+  "vpc": "my-vpc-name",
+  "subnetsPerAvailabilityZone": [
+    {"availabilityZone": "us-east-1a", "subnetId": "my-name-1"},
+    {"availabilityZone": "us-east-1b", "subnetId": "my-name-2"},
+    {"availabilityZone": "us-east-1c", "subnetId": "my-name-3"},
+    {"availabilityZone": "us-east-1d", "subnetId": "my-name-4"}
+  ],
+  "securityGroups": {
+    "restoreServer": ["my-name-sg"],
+    "restoredRdsInstance": ["my-name-sg"]
+  }
+}]
+```
+
+Using names requires the restore-account role to describe VPCs, subnets, and
+security groups. Redeploy `cross-account-role.yaml` (or the StackSet) before the
+first name-based run. `OrganizationAccountAccessRole` and
+`AWSControlTowerExecution` already can.
+
 **Snapshot selection** — `snapshotDate` takes one of:
 
 | Value | Behaviour |
@@ -291,7 +323,7 @@ S3 bucket names are **globally unique** across all AWS accounts worldwide. This 
 | `resourceNamePrefix` | No | Prefix for restored resource names (null = use original names) |
 | `dynamodbRegionalWcuLimit` | No | Total WCU budget per region across all tables (default: 40000). See [DynamoDB WCU Allocation](#dynamodb-wcu-allocation) |
 | `dynamodbTableWcuMax` | No | Max WCU any single table can receive (default: 40000). Caps individual tables when the regional limit is raised |
-| `vpcConfigs` | Yes | Network configuration per region (creates KMS keys and RDS subnet groups automatically) |
+| `vpcConfigs` | Yes | Network configuration per region. `vpc`, `subnetId`, and security group entries accept a resource ID or a name (the `Name` tag; a security group also matches its group name). Names are resolved to IDs in the restore account before bootstrap. Also creates KMS keys and RDS subnet groups |
 | `crossAccountRoleArn` | No | Custom role ARN or null for Organizations |
 | `restoreAccountName` | No | Display name in Eon (null = auto-generate) |
 | `excludeEC2TagKeys` | No | List of tag keys to exclude from restored EC2 instances and volumes (default: []) |
@@ -412,16 +444,17 @@ fails loudly rather than reaching an account.
 
 ## How It Works
 
-1. **Bootstrap** - Creates KMS keys in each region, RDS subnet groups, IAM roles. If the IAM stack already exists but its restore role is missing (deleted out-of-band, or a prior create rolled back), the workflow stops with an actionable error telling you to delete the stack and re-run, rather than handing Eon a role ARN it cannot assume.
-2. **Connect** - Registers restore account with Eon. If a matching account already exists and is `DISCONNECTED` or `INSUFFICIENT_PERMISSIONS`, the step reconnects and polls for `CONNECTED` (and lets the Step Functions retry back off), giving roles just installed by bootstrap time to propagate.
-3. **Configure** - Sets up VPC connectivity
-4. **List Resources** - Retrieves resources in scope (`resourceTypes` / `resourceIds` are applied here, server-side)
-5. **Get Snapshots** - Selects a snapshot per resource, extracts table sizes. Resources with nothing to restore are recorded with a reason; if that is all of them, the run stops here with a notification
-6. **Initiate Restores** - If `recoveryStackNames` provided:
+1. **Resolve VPC names** - Looks up any VPC, subnet, or security group names in `vpcConfigs` and replaces them with IDs. IDs pass through unchanged. Runs before bootstrap so subnet groups are created from real subnet IDs.
+2. **Bootstrap** - Creates KMS keys in each region, RDS subnet groups, IAM roles. If the IAM stack already exists but its restore role is missing (deleted out-of-band, or a prior create rolled back), the workflow stops with an actionable error telling you to delete the stack and re-run, rather than handing Eon a role ARN it cannot assume.
+3. **Connect** - Registers restore account with Eon. If a matching account already exists and is `DISCONNECTED` or `INSUFFICIENT_PERMISSIONS`, the step reconnects and polls for `CONNECTED` (and lets the Step Functions retry back off), giving roles just installed by bootstrap time to propagate.
+4. **Configure** - Sets up VPC connectivity
+5. **List Resources** - Retrieves resources in scope (`resourceTypes` / `resourceIds` are applied here, server-side)
+6. **Get Snapshots** - Selects a snapshot per resource, extracts table sizes. Resources with nothing to restore are recorded with a reason; if that is all of them, the run stops here with a notification
+7. **Initiate Restores** - If `recoveryStackNames` provided:
    - **DynamoDB**: Queries stacks for `AWS::DynamoDB::Table` and `AWS::DynamoDB::GlobalTable` resources, uses in-place restore for matches (by table name + region), temporarily scales up WCU
    - **S3**: Queries stacks for `AWS::S3::Bucket` resources, uses in-place restore for matches (by `s3InPlaceTagKey` tag, default `eon_functional_id`)
    - Otherwise: Creates new tables with allocated WCUs (38k per region = 95% of 40k) and new S3 buckets with hash suffixes
-7. **Monitor** - Polls until completion (default: 60 hours max), restores DynamoDB WCU to original settings as each in-place restore completes
+8. **Monitor** - Polls until completion (default: 60 hours max), restores DynamoDB WCU to original settings as each in-place restore completes
 
 Example completion notification:
 

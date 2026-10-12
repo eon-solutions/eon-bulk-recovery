@@ -5,6 +5,25 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **`vpcConfigs` accepts names as well as IDs.** `vpc`, `subnetId`, and the security
+  group lists may be the name stamped on the resource when the account was created,
+  instead of `vpc-` / `subnet-` / `sg-` IDs. A name is the resource's `Name` tag; a
+  security group also matches its group name. A new `Resolve VPC Configs` step looks
+  the names up in the restore account, and every later step sees IDs. A value that is
+  already an ID is left unchanged, so an existing execution input keeps working
+  without new permissions.
+
+### Changed
+
+- **The cross-account role can describe VPCs, subnets, and security groups.**
+  Required when `vpcConfigs` uses names. Redeploy `cross-account-role.yaml` (or the
+  StackSet) in the restore account before a name-based run. Accounts reached through
+  `OrganizationAccountAccessRole` or `AWSControlTowerExecution` already have this access.
+
 ## [1.2.1] - 2026-10-05
 
 ### Fixed

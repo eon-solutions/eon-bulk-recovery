@@ -18,7 +18,46 @@
         "merged.$": "States.JsonMerge($.inputDefaults, $, false)"
       },
       "OutputPath": "$.merged",
+      "Next": "Resolve VPC Configs"
+    },
+    "Resolve VPC Configs": {
+      "Type": "Task",
+      "Resource": "${ResolveVpcConfigsFunctionArn}",
+      "Comment": "Replace VPC, subnet, and security group names in vpcConfigs with IDs. Values that are already IDs pass through, and the resolved list overwrites vpcConfigs for every later step.",
+      "Parameters": {
+        "step": "resolve_vpc_configs",
+        "restoreAccountId.$": "$.restoreAccountId",
+        "restoreRegion.$": "$.restoreRegion",
+        "vpcConfigs.$": "$.vpcConfigs",
+        "crossAccountRoleArn.$": "$.crossAccountRoleArn"
+      },
+      "ResultPath": "$.vpcConfigs",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "States.TaskFailed",
+            "States.Timeout"
+          ],
+          "IntervalSeconds": 30,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error",
+          "Next": "Resolve VPC Configs Failed"
+        }
+      ],
       "Next": "Bootstrap Restore Account"
+    },
+    "Resolve VPC Configs Failed": {
+      "Type": "Fail",
+      "Error": "ResolveVpcConfigsFailed",
+      "Cause": "Failed to resolve VPC, subnet, or security group names to IDs in the restore account"
     },
     "Bootstrap Restore Account": {
       "Type": "Task",

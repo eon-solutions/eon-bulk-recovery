@@ -365,6 +365,17 @@ Resources:
                           - ec2:DescribeInstanceTypeOfferings
                         Resource: '*'
 
+                      # resolve_vpc_configs looks up VPC, subnet, and security
+                      # group names (Name tag, plus GroupName for security
+                      # groups). These describe APIs have no resource scope.
+                      - Sid: VpcNameResolution
+                        Effect: Allow
+                        Action:
+                          - ec2:DescribeVpcs
+                          - ec2:DescribeSubnets
+                          - ec2:DescribeSecurityGroups
+                        Resource: '*'
+
                       # DynamoDB — in-place restore WCU scaling and warm throughput.
                       - Sid: DynamoDbWcuScaling
                         Effect: Allow
