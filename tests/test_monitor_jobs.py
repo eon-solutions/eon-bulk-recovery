@@ -628,7 +628,27 @@ class TestCompletionNotification:
 
         send_completion_notification(summary(vpcConfigs=configs), timeout=False)
 
-        assert "vpc-1 in us-east-1 (2 subnets)" in published(sns)["Message"]
+        assert (
+            "vpc-1 in us-east-1 (2 subnets, cross-region vault reads via Multi-Region Access Point)"
+            in published(sns)["Message"]
+        )
+
+    def test_a_vpc_that_opted_out_of_the_access_point_says_so(self, sns):
+        configs = [
+            {
+                "vpc": "vpc-1",
+                "region": "us-east-1",
+                "subnetsPerAvailabilityZone": [{}],
+                "privateSubnetEnabled": False,
+            }
+        ]
+
+        send_completion_notification(summary(vpcConfigs=configs), timeout=False)
+
+        assert (
+            "vpc-1 in us-east-1 (1 subnets, cross-region vault reads via regional access point)"
+            in published(sns)["Message"]
+        )
 
     def test_failed_wcu_restoration_adds_an_action_required_section(self, sns):
         failure = job(
@@ -867,7 +887,7 @@ class TestRemainingBranches:
 
         send_completion_notification(summary(vpcConfigs=config), timeout=False)
 
-        assert "vpc-1 in us-east-1 (1 subnets)" in published(sns)["Message"]
+        assert "vpc-1 in us-east-1 (1 subnets, " in published(sns)["Message"]
 
     def test_no_vpc_configs_reads_as_none(self, sns):
         send_completion_notification(summary(vpcConfigs=[]), timeout=False)

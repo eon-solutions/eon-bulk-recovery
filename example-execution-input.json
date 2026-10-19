@@ -19,6 +19,7 @@
     {
       "region": "us-east-1",
       "vpc": "vpc-00000000000000001",
+      "privateSubnetEnabled": true,
       "subnetsPerAvailabilityZone": [
         {
           "availabilityZone": "us-east-1a",
@@ -45,6 +46,7 @@
     {
       "region": "us-west-2",
       "vpc": "vpc-00000000000000002",
+      "privateSubnetEnabled": true,
       "subnetsPerAvailabilityZone": [
         {
           "availabilityZone": "us-west-2a",

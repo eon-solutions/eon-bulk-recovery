@@ -12,6 +12,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from lib.eon_client import EonClient
 from lib.aws_utils import get_eon_credentials, get_cross_account_credentials, create_boto3_client
+from lib.vpc_configs import private_subnet_enabled
 
 
 # Eon restore job statuses (JobStatus enum — see JobStatus.yaml in eon-service).
@@ -559,7 +560,14 @@ def send_completion_notification(job_summary: Dict[str, Any], timeout: bool) -> 
             vpc_id = vpc_config.get("vpc", "Unknown")
             region = vpc_config.get("region", restore_region)
             subnet_count = len(vpc_config.get("subnetsPerAvailabilityZone", []))
-            vpc_summary_lines.append(f"  - {vpc_id} in {region} ({subnet_count} subnets)")
+            vault_path = (
+                "Multi-Region Access Point" if private_subnet_enabled(vpc_config)
+                else "regional access point"
+            )
+            vpc_summary_lines.append(
+                f"  - {vpc_id} in {region} ({subnet_count} subnets, "
+                f"cross-region vault reads via {vault_path})"
+            )
 
     vpc_summary = "\n".join(vpc_summary_lines) if vpc_summary_lines else "None"
 

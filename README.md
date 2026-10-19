@@ -201,6 +201,7 @@ aws stepfunctions start-execution \
   "vpcConfigs": [{
     "region": "us-east-1",
     "vpc": "vpc-xxx",
+    "privateSubnetEnabled": true,
     "subnetsPerAvailabilityZone": [
       {"availabilityZone": "us-east-1a", "subnetId": "subnet-xxx"},
       {"availabilityZone": "us-east-1b", "subnetId": "subnet-yyy"}
@@ -301,13 +302,52 @@ S3 bucket names are **globally unique** across all AWS accounts worldwide. This 
 | `resourceNamePrefix` | No | Prefix for restored resource names (null = use original names) |
 | `dynamodbRegionalWcuLimit` | No | Total WCU budget per region across all tables (default: 40000). See [DynamoDB WCU Allocation](#dynamodb-wcu-allocation) |
 | `dynamodbTableWcuMax` | No | Max WCU any single table can receive (default: 40000). Caps individual tables when the regional limit is raised |
-| `vpcConfigs` | Yes | Network configuration per region (creates KMS keys and RDS subnet groups automatically) |
+| `vpcConfigs` | Yes | Network configuration per region (creates KMS keys and RDS subnet groups automatically). Each entry's `privateSubnetEnabled` defaults to `true`; see [Cross-Region Vault Reads](#cross-region-vault-reads) |
 | `crossAccountRoleArn` | No | Custom role ARN or null for Organizations |
 | `restoreAccountName` | No | Display name in Eon (null = auto-generate) |
 | `excludeEC2TagKeys` | No | List of tag keys to exclude from restored EC2 instances and volumes (default: []) |
 | `recoveryStackNames` | No | List of CloudFormation stack names to scan for pre-created DynamoDB tables and S3 buckets (default: []) |
 | `recoveryStacksOnly` | No | When `true`, only restore resources that match a stack table/bucket — skip EC2, RDS, and unmatched DynamoDB/S3 (default: false) |
 | `s3InPlaceTagKey` | No | Tag key used to match source and target S3 buckets for in-place restore (default: `"eon_functional_id"`). The tag value can be any string — bucket name, hash, UUID, etc. |
+
+### Cross-Region Vault Reads
+
+A restore whose target region differs from the vault's region reads the vault from another
+region. Eon has two ways to do that, chosen per VPC by `privateSubnetEnabled` in `vpcConfigs`:
+
+| `privateSubnetEnabled` | How the restore server reaches the vault |
+|------------------------|------------------------------------------|
+| `true` (the default, also when the key is omitted or `null`) | Through an S3 Multi-Region Access Point that Eon creates on the vault for the job and removes afterwards. A `com.amazonaws.s3-global.accesspoint` interface endpoint in the restore VPC keeps that traffic on AWS PrivateLink. |
+| `false` | Through the vault region's regional access point, which the restore server can only reach over the internet: an internet gateway, or a NAT gateway from a private subnet. |
+
+The workflow defaults to `true` because the restore server normally runs in a private subnet,
+and with the regional access point every byte of a cross-region restore crosses the NAT gateway
+and is billed as NAT processing. Over the interface endpoint the same bytes are billed at the
+PrivateLink rate instead, and a subnet with no internet route at all can restore cross-region.
+AWS adds a small per-GB routing charge for traffic through a Multi-Region Access Point.
+
+The default does not create the endpoint. A VPC with a NAT gateway and no
+`s3-global.accesspoint` interface endpoint still restores with the default, and still sends the
+traffic through the NAT gateway; the saving starts when the endpoint exists. Create it with
+private DNS enabled, in the VPC named in `vpcConfigs`, alongside the other endpoints a private
+restore subnet needs (the regional S3 and DynamoDB gateway endpoints, and the ECR, STS and SQS
+interface endpoints). [AWS: Restore Server Requirements] has the full list. An isolated subnet
+without the interface endpoint reaches a vault in another region by neither path, and the
+restore stalls rather than failing fast; creating the endpoint fixes it.
+
+Set `"privateSubnetEnabled": false` on a VPC to keep the regional access point for it, for
+example when the restore server runs in a public subnet and the routing charge is not worth
+paying. Same-region restores never use either path, so the flag has no effect on them. A value
+other than `true`, `false` or `null` fails the `Configure VPC` step.
+
+Self-managed (BYOV) vaults are outside this flag: Eon cannot create an access point on a bucket
+it does not own, so cross-region reads from such a vault use the access point alias configured
+on the vault itself.
+
+The `Configure VPC` log prints the path each VPC was configured with, and the completion
+notification repeats it next to each VPC.
+
+[AWS: Restore Server Requirements]: https://docs.eon.io/data-protection/cloud-workloads/aws/restore-accounts/aws-restore-server-requirements
 
 ### DynamoDB Restore Method
 
@@ -425,7 +465,7 @@ fails loudly rather than reaching an account.
 
 1. **Bootstrap** - Creates KMS keys in each region, RDS subnet groups, IAM roles. If the IAM stack already exists but its restore role is missing (deleted out-of-band, or a prior create rolled back), the workflow stops with an actionable error telling you to delete the stack and re-run, rather than handing Eon a role ARN it cannot assume.
 2. **Connect** - Registers restore account with Eon. If a matching account already exists and is `DISCONNECTED` or `INSUFFICIENT_PERMISSIONS`, the step reconnects and polls for `CONNECTED` (and lets the Step Functions retry back off), giving roles just installed by bootstrap time to propagate.
-3. **Configure** - Sets up VPC connectivity
+3. **Configure** - Registers the VPC connectivity with Eon. Every VPC is sent with `privateSubnetEnabled: true` unless the input says `false`, so cross-region restores read the vault through an S3 Multi-Region Access Point (see [Cross-Region Vault Reads](#cross-region-vault-reads))
 4. **List Resources** - Retrieves resources in scope (`resourceTypes` / `resourceIds` are applied here, server-side)
 5. **Get Snapshots** - Selects a snapshot per resource, extracts table sizes. Resources with nothing to restore are recorded with a reason; if that is all of them, the run stops here with a notification
 6. **Initiate Restores** - If `recoveryStackNames` provided:
@@ -449,7 +489,7 @@ Restore Account: 222222222222
 Default Restore Region: us-east-1 (resources restored to original regions)
 Snapshot Date(s): 2026-08-29
 VPC Configurations:
-  - vpc-00000000000000001 in us-east-1 (3 subnets)
+  - vpc-00000000000000001 in us-east-1 (3 subnets, cross-region vault reads via Multi-Region Access Point)
 Total Duration: 0h 15m
 
 Job Summary:
