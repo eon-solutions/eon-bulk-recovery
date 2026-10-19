@@ -397,6 +397,12 @@ def plan_dynamodb_restore_methods(
 # DynamoDB WCU allocation
 # ---------------------------------------------------------------------------
 
+# The fewest WCU a sized table is allocated. Proportional allocation rounds a small
+# table next to a very large one down to almost nothing, and a table restoring at
+# 1 WCU crawls; 10 is still a negligible share of any regional budget.
+MIN_TABLE_WCU = 10
+
+
 def calculate_dynamodb_wcu_allocation_by_region(
     dynamodb_tables_by_region: Dict[str, List[Dict[str, Any]]],
     regional_wcu_capacity: int = 40000,
@@ -417,6 +423,8 @@ def calculate_dynamodb_wcu_allocation_by_region(
         table_wcu_max: Maximum WCU any single table can receive (default 40000).
             Prevents a single large table from consuming all provisioned capacity
             when the regional limit has been raised above the default.
+
+    Every sized table gets at least MIN_TABLE_WCU, whatever its share works out to.
 
     Returns:
         Dictionary mapping resource_id to allocated WCU
@@ -462,7 +470,7 @@ def calculate_dynamodb_wcu_allocation_by_region(
             for table in dynamodb_tables:
                 proportion = table["sizeBytes"] / total_size
                 proportional_wcu = int(available_wcu * proportion)
-                allocated_wcu = min(max(proportional_wcu, 1), table_wcu_max)
+                allocated_wcu = min(max(proportional_wcu, MIN_TABLE_WCU), table_wcu_max)
 
                 wcu_allocation[table["resourceId"]] = allocated_wcu
                 allocated_total += allocated_wcu

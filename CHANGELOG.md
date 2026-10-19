@@ -16,6 +16,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the same `LambdaExecutionRoleName`, with the same default, so the chain role can trust a
   renamed Lambda role.
 
+### Changed
+
+- **Every sized DynamoDB table is allocated at least 10 WCU**, up from 1. Proportional
+  allocation rounded a small table next to a very large one down to 1 WCU, and such a table
+  restored at a crawl. The floor is still a negligible share of the regional budget. Tables
+  reporting 0 bytes are unchanged: they get no allocation and Eon's own minimum applies.
+
 ## [1.2.1] - 2026-10-05
 
 ### Fixed
