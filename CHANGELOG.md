@@ -5,6 +5,17 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **`LambdaExecutionRoleName` and `StepFunctionsRoleName` template parameters.** The two IAM
+  role names were fixed, so a second copy of the stack in the same account failed on them
+  even though every other resource is already named after the stack. Both default to the
+  previous names, so an existing deployment is unchanged. `management-account-role.yaml` takes
+  the same `LambdaExecutionRoleName`, with the same default, so the chain role can trust a
+  renamed Lambda role.
+
 ## [1.2.1] - 2026-10-05
 
 ### Fixed

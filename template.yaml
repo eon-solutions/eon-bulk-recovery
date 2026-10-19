@@ -35,6 +35,21 @@ Parameters:
     Description: Email address for SNS notifications (optional)
     Default: ''
 
+  LambdaExecutionRoleName:
+    Type: String
+    Description: >-
+      Name of the Lambda execution role. The chain role (management-account-role.yaml) and the
+      cross-account roles (cross-account-role.yaml) trust this name, so change them together.
+      Override it to deploy a second copy of this stack in the same account.
+    Default: EonBulkRecoveryLambdaRole
+
+  StepFunctionsRoleName:
+    Type: String
+    Description: >-
+      Name of the Step Functions execution role. Override it to deploy a second copy of this
+      stack in the same account.
+    Default: EonBulkRecoveryStepFunctionsRole
+
 Conditions:
   HasNotificationEmail: !Not [!Equals [!Ref NotificationEmail, '']]
 
@@ -76,7 +91,7 @@ Resources:
   LambdaExecutionRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: !Sub '${AWS::StackName}-lambda-role'
+      RoleName: !Ref LambdaExecutionRoleName
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -162,7 +177,7 @@ Resources:
   StepFunctionsExecutionRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: !Sub '${AWS::StackName}-step-functions-role'
+      RoleName: !Ref StepFunctionsRoleName
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:

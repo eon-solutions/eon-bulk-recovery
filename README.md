@@ -76,8 +76,9 @@ aws cloudformation deploy \
 
 Then pass the stack's `CrossAccountRoleArn` output as the `crossAccountRoleArn`
 field in the execution input. Optional parameters: `CrossAccountRoleName`,
-`LambdaExecutionRoleName` (default `EonBulkRecoveryLambdaRole`), and
-`PermissionsBoundaryArn` (for orgs that mandate a boundary).
+`LambdaExecutionRoleName` (must match the application stack's parameter of the same
+name, default `EonBulkRecoveryLambdaRole`), and `PermissionsBoundaryArn` (for orgs
+that mandate a boundary).
 
 **What it grants:** CloudFormation (deploy Eon's `restore-account.yml`, list
 recovery-stack resources), IAM scoped to `EonRestore*` (the bootstrap stack
@@ -149,6 +150,15 @@ sam deploy --guided --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM
 - `EonClientId` / `EonClientSecret` - API credentials
 - `ManagementAccountId` - (Optional) For AWS Organizations
 - `NotificationEmail` - (Optional) For completion alerts
+- `LambdaExecutionRoleName` / `StepFunctionsRoleName` - (Optional) IAM role names, default `EonBulkRecoveryLambdaRole` / `EonBulkRecoveryStepFunctionsRole`
+
+**A second copy in the same account** (to test a change next to the deployment you rely
+on): give it its own `--stack-name` and override both role names, since IAM role names are
+account-wide. Everything else in the stack is already named after the stack. The chain role
+in the management account and any `cross-account-role.yaml` deployment trust the Lambda
+role by name, and each takes one name, so either deploy them again with the test copy's
+`LambdaExecutionRoleName` or point the test copy at a restore account through
+`crossAccountRoleArn`.
 
 ## Usage
 

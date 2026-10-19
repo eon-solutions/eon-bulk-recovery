@@ -11,10 +11,9 @@ Parameters:
   LambdaExecutionRoleName:
     Type: String
     Description: >-
-      Name of the Lambda execution role in the backup account that may assume this
-      role. The application names that role ${StackName}-lambda-role, so the
-      eon-bulk-recovery stack uses eon-bulk-recovery-lambda-role.
-    Default: eon-bulk-recovery-lambda-role
+      Name of the Lambda execution role in the backup account that may assume this role.
+      Matches the LambdaExecutionRoleName parameter of the application stack.
+    Default: EonBulkRecoveryLambdaRole
 
 Resources:
   EonBulkRecoveryChainRole:
