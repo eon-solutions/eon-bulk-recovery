@@ -351,6 +351,7 @@ When restoring DynamoDB tables, the workflow distributes Write Capacity Units (W
 1. 95% of the regional WCU limit is used (default: 38,000 out of 40,000) to leave headroom
 2. Tables reporting 0 bytes get no allocation. There is nothing to write back, so any WCU they took would come out of a table that does have data. The restore request omits `writeCapacityUnits` for these and Eon applies its own minimum
 3. The budget is split between the tables with known sizes, proportionally to size — a 10 GB table gets 10× the WCUs of a 1 GB table
+4. Every sized table gets at least 10 WCU. Proportional allocation rounds a small table next to a very large one down to almost nothing, and a table restoring at 1 WCU crawls
 
 **Example:** 3 tables in us-east-1 with a 40,000 WCU limit:
 
